@@ -120,6 +120,7 @@ class _RideScreenState extends State<RideScreen> {
   /// "Student Not Available/Ready" prompt when it runs out.
   void _tick() {
     if (!mounted) return;
+    if (_pos != null) _updateNavigation(_pos!);
     final cur = _current;
     if (_isPickup && cur != null && _arrivedStops.contains(cur.stop.id) && _countdownEnd == null) {
       final due = cur.stop.scheduledToday;
@@ -300,23 +301,35 @@ class _RideScreenState extends State<RideScreen> {
 
   // ------------------------------------------------------------------ navigation
 
+  bool _drawingLine = false;
+  bool _lineDirty = false;
+
+  /// Redraws the blue road route. Always clears the old line and adds a fresh one (updating in
+  /// place was unreliable on the web map), and runs one redraw at a time so two quick changes
+  /// cannot leave an old line behind.
   Future<void> _drawRouteLine() async {
     final c = _map;
     if (c == null || !_styleReady) return;
-    final r = _route;
-    if (r == null || r.points.length < 2) {
-      if (_routeLine != null) {
-        await c.removeLine(_routeLine!);
-        _routeLine = null;
-      }
+    if (_drawingLine) {
+      _lineDirty = true;
       return;
     }
-    final pts = [for (final p in r.points) LatLng(p.lat, p.lng)];
-    if (_routeLine == null) {
-      _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
-    } else {
-      await c.updateLine(_routeLine!,
-          LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
+    _drawingLine = true;
+    try {
+      do {
+        _lineDirty = false;
+        await c.clearLines();
+        _routeLine = null;
+        final r = _route;
+        if (r != null && r.points.length > 1) {
+          final pts = [for (final p in r.points) LatLng(p.lat, p.lng)];
+          _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
+        }
+      } while (_lineDirty);
+    } catch (e) {
+      if (mounted) setState(() => _mapError = e.toString());
+    } finally {
+      _drawingLine = false;
     }
   }
 
@@ -335,6 +348,14 @@ class _RideScreenState extends State<RideScreen> {
     if (!need) {
       _advanceStep(p);
       return;
+    }
+    if (r != null && _routeStopId != cur.stop.id) {
+      // The next student is at a different stop: remove the old route line right away.
+      setState(() {
+        _route = null;
+        _routeError = null;
+      });
+      _drawRouteLine();
     }
     if (since < 5) return; // be gentle with the free routing server
     if (r == null && _routeError != null && since < 30) return;
