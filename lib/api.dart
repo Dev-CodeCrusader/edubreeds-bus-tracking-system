@@ -56,7 +56,8 @@ class StopInfo {
   DateTime? get scheduledToday {
     final t = scheduledTime;
     if (t == null) return null;
-    final p = t.split(':').map(int.parse).toList();
+    // Seconds may carry a fraction ("05.415158"), so cut it off before reading.
+    final p = t.split(':').map((x) => int.parse(x.split('.').first)).toList();
     final n = DateTime.now();
     return DateTime(n.year, n.month, n.day, p[0], p[1], p.length > 2 ? p[2] : 0);
   }
