@@ -75,14 +75,24 @@ class Api {
     final uid = db.auth.currentUser!.id;
     final row = await db
         .from('profiles')
-        .select('id, role, full_name, school_id, schools(name, photos_enabled)')
+        .select('id, role, full_name, school_id')
         .eq('id', uid)
         .single();
-    final school = row['schools'] as Map?;
+    // The school lookup is separate so a problem there never blocks sign-in.
+    Map? school;
+    if (row['school_id'] != null) {
+      try {
+        school = await db
+            .from('schools')
+            .select('name, photos_enabled')
+            .eq('id', row['school_id'])
+            .maybeSingle();
+      } catch (_) {}
+    }
     return DriverProfile(
       row['id'],
-      row['role'],
-      row['full_name'],
+      row['role'].toString(),
+      row['full_name'] ?? '',
       row['school_id'],
       school?['name'] ?? '',
       (school?['photos_enabled'] ?? true) as bool,
