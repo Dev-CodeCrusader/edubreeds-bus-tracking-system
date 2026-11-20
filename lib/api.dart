@@ -68,7 +68,8 @@ class TripStop {
   final String state;
   final StopInfo stop;
   final StudentInfo student;
-  TripStop(this.id, this.state, this.stop, this.student);
+  final DateTime? vanArrivedAt; // saved on the server when the van reached the stop
+  TripStop(this.id, this.state, this.stop, this.student, this.vanArrivedAt);
 }
 
 class Api {
@@ -152,10 +153,26 @@ class Api {
     return id as String;
   }
 
+  /// The driver's unfinished trip (started in the last 14 hours), if any. Used to resume
+  /// after the page is refreshed or the app is closed and reopened.
+  static Future<Map<String, dynamic>?> activeTrip() async {
+    final uid = db.auth.currentUser!.id;
+    final since = DateTime.now().toUtc().subtract(const Duration(hours: 14)).toIso8601String();
+    final rows = await db
+        .from('trips')
+        .select('id, mode')
+        .eq('driver_id', uid)
+        .eq('state', 'active')
+        .gte('started_at', since)
+        .order('started_at', ascending: false)
+        .limit(1);
+    return rows.isEmpty ? null : Map<String, dynamic>.from(rows.first);
+  }
+
   static Future<List<TripStop>> tripStops(String tripId) async {
     final rows = await db
         .from('trip_stops')
-        .select('id, state, '
+        .select('id, state, van_arrived_at, '
             'students(id, full_name, class_name, photo_url), '
             'stops(id, seq, name, radius_m, scheduled_time, lat, lng)')
         .eq('trip_id', tripId);
@@ -168,6 +185,7 @@ class Api {
         StopInfo(st['id'], st['seq'], st['name'], st['radius_m'], st['scheduled_time'],
             st['lat'] == null ? null : GeoPoint((st['lat'] as num).toDouble(), (st['lng'] as num).toDouble())),
         StudentInfo(s['id'], s['full_name'], s['class_name'], s['photo_url']),
+        r['van_arrived_at'] == null ? null : DateTime.parse(r['van_arrived_at'] as String).toLocal(),
       );
     }).toList();
     list.sort((a, b) {
