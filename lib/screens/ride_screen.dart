@@ -8,6 +8,7 @@ import 'package:maplibre_gl/maplibre_gl.dart';
 import '../api.dart';
 import '../config.dart';
 import '../location_service.dart';
+import '../routing.dart';
 
 /// The 50/50 ride screen: map on top, control deck below.
 /// Pickup: [Picked Up] [Student Absent] [Alert (time-gated)]
@@ -37,6 +38,13 @@ class _RideScreenState extends State<RideScreen> {
   MapLibreMapController? _map;
   bool _styleReady = false;
   Circle? _vehicle;
+  Line? _routeLine;
+  RouteResult? _route;
+  String? _routeStopId;
+  String? _routeError;
+  bool _routing = false;
+  DateTime _lastRouteAt = DateTime.fromMillisecondsSinceEpoch(0);
+  int _stepIdx = 0;
 
   bool get _isPickup => widget.mode == 'pickup';
 
@@ -90,6 +98,7 @@ class _RideScreenState extends State<RideScreen> {
     });
     _moveVehicle(p);
     _checkArrival(p);
+    _updateNavigation(p);
   }
 
   void _checkArrival(Position p) {
@@ -272,18 +281,135 @@ class _RideScreenState extends State<RideScreen> {
       final l = s.stop.location;
       if (l != null && seen.add(s.stop.id)) pts.add(LatLng(l.lat, l.lng));
     }
-    if (pts.length > 1) {
-      // Straight segments between stops for now; road-following polyline comes with the routing engine.
-      await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 4, lineOpacity: 0.8));
-    }
+    _routeLine = null; // cleared above; the road route is drawn again below
     for (final p in pts) {
       await c.addCircle(CircleOptions(
           geometry: p, circleRadius: 6, circleColor: '#FFFFFF', circleStrokeColor: '#1B5E9E', circleStrokeWidth: 3));
     }
+    await _drawRouteLine();
     if (pts.isNotEmpty && _pos == null) {
       await c.animateCamera(CameraUpdate.newLatLngZoom(pts.first, 14));
     }
     if (_pos != null) await _moveVehicle(_pos!);
+  }
+
+  // ------------------------------------------------------------------ navigation
+
+  Future<void> _drawRouteLine() async {
+    final c = _map;
+    if (c == null || !_styleReady) return;
+    final r = _route;
+    if (r == null || r.points.length < 2) {
+      if (_routeLine != null) {
+        await c.removeLine(_routeLine!);
+        _routeLine = null;
+      }
+      return;
+    }
+    final pts = [for (final p in r.points) LatLng(p.lat, p.lng)];
+    if (_routeLine == null) {
+      _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
+    } else {
+      await c.updateLine(_routeLine!, LineOptions(geometry: pts));
+    }
+  }
+
+  /// Fetches a road route from the bus to the next stop, redraws it when the driver leaves
+  /// the route, and moves the "next turn" along as the bus passes each manoeuvre.
+  void _updateNavigation(Position p) {
+    final cur = _current;
+    final loc = cur?.stop.location;
+    if (cur == null || loc == null || _routing) return;
+    final r = _route;
+    final since = DateTime.now().difference(_lastRouteAt).inSeconds;
+
+    var need = r == null || _routeStopId != cur.stop.id;
+    if (!need && since >= 10 && r != null) need = r.distanceFromRoute(p.latitude, p.longitude) > 60; // off route
+    if (!need && since >= 60) need = true; // refresh the time estimate
+    if (!need) {
+      _advanceStep(p);
+      return;
+    }
+    if (since < 5) return; // be gentle with the free routing server
+    if (r == null && _routeError != null && since < 30) return;
+
+    _routing = true;
+    _lastRouteAt = DateTime.now();
+    final stopId = cur.stop.id;
+    Routing.route(p.latitude, p.longitude, loc.lat, loc.lng).then((res) {
+      if (!mounted) return;
+      setState(() {
+        _route = res;
+        _routeStopId = stopId;
+        _routeError = null;
+        _stepIdx = 0;
+      });
+      _drawRouteLine();
+    }).catchError((Object e) {
+      if (mounted) {
+        setState(() {
+          _routeError = e.toString();
+          _routeStopId = stopId;
+        });
+      }
+    }).whenComplete(() => _routing = false);
+  }
+
+  void _advanceStep(Position p) {
+    final r = _route;
+    if (r == null) return;
+    var moved = false;
+    while (_stepIdx + 1 < r.steps.length - 1) {
+      final next = r.steps[_stepIdx + 1].at;
+      if (Geolocator.distanceBetween(p.latitude, p.longitude, next.lat, next.lng) < 25) {
+        _stepIdx++;
+        moved = true;
+      } else {
+        break;
+      }
+    }
+    if (moved && mounted) setState(() {});
+  }
+
+  Widget _navBanner() {
+    final cur = _current;
+    if (cur == null) return const SizedBox.shrink();
+    final r = _route;
+    String title;
+    String sub = '';
+    if (r == null) {
+      title = _routeError != null ? 'Road route unavailable' : 'Finding the best route...';
+      if (_routeError != null) sub = 'Drive to the stop shown on the map';
+    } else {
+      final idx = (_stepIdx + 1 < r.steps.length) ? _stepIdx + 1 : r.steps.length - 1;
+      final step = r.steps[idx];
+      title = step.text;
+      if (_pos != null) {
+        final d = Geolocator.distanceBetween(_pos!.latitude, _pos!.longitude, step.at.lat, step.at.lng);
+        sub = 'in ${d >= 1000 ? '${(d / 1000).toStringAsFixed(1)} km' : '${(d / 10).round() * 10} m'}  ·  ';
+      }
+      final km = r.distanceM / 1000;
+      final mins = (r.durationS / 60).ceil();
+      sub += '${km.toStringAsFixed(1)} km, about $mins min to the stop';
+    }
+    return Material(
+      elevation: 3,
+      borderRadius: BorderRadius.circular(12),
+      color: Theme.of(context).colorScheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(children: [
+          const Icon(Icons.navigation),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w700), maxLines: 2, overflow: TextOverflow.ellipsis),
+              if (sub.isNotEmpty) Text(sub, style: const TextStyle(fontSize: 12)),
+            ]),
+          ),
+        ]),
+      ),
+    );
   }
 
   Future<void> _moveVehicle(Position p) async {
@@ -454,13 +580,16 @@ class _RideScreenState extends State<RideScreen> {
           children: [
             Expanded(
               flex: 1,
-              child: MapLibreMap(
-                styleString: mapStyleUrl,
-                initialCameraPosition: const CameraPosition(target: LatLng(20.2961, 85.8245), zoom: 12),
-                onMapCreated: (c) => _map = c,
-                onStyleLoadedCallback: _onStyleLoaded,
-                compassEnabled: false,
-              ),
+              child: Stack(children: [
+                MapLibreMap(
+                  styleString: mapStyleUrl,
+                  initialCameraPosition: const CameraPosition(target: LatLng(20.2961, 85.8245), zoom: 12),
+                  onMapCreated: (c) => _map = c,
+                  onStyleLoadedCallback: _onStyleLoaded,
+                  compassEnabled: false,
+                ),
+                Positioned(top: 8, left: 8, right: 8, child: _navBanner()),
+              ]),
             ),
             const Divider(height: 1),
             Expanded(flex: 1, child: _deck()),
