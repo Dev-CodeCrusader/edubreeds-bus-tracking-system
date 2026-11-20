@@ -28,6 +28,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Uint8List? _selfieBytes;
   bool _loading = true;
   bool _starting = false;
+  bool _resumeChecked = false;
   String? _error;
 
   @override
@@ -46,11 +47,32 @@ class _HomeScreenState extends State<HomeScreen> {
         _loading = false;
       });
       _pickDefaultRoute();
+      _resumeActiveTrip();
     } catch (e) {
       setState(() {
         _error = 'Could not load your routes. Pull down to retry.';
         _loading = false;
       });
+    }
+  }
+
+  /// If the driver already has a trip running (page refreshed, app closed and reopened),
+  /// go straight back to it instead of starting over.
+  Future<void> _resumeActiveTrip() async {
+    if (_resumeChecked) return;
+    _resumeChecked = true;
+    try {
+      final t = await Api.activeTrip();
+      if (t == null || !mounted) return;
+      await LocationService.ensurePermission();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Resuming your trip...')));
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => RideScreen(
+            tripId: t['id'] as String, mode: t['mode'] as String, photosEnabled: _me?.photosEnabled ?? true),
+      ));
+    } catch (_) {
+      // If the check fails the driver can still start normally.
     }
   }
 
