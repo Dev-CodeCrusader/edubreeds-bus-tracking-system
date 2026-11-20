@@ -31,6 +31,7 @@ class _RideScreenState extends State<RideScreen> {
   bool _busy = false;
   String? _loadError;
   String? _locError;
+  String? _mapError;
   Position? _pos;
   late final LocationService _loc;
   Timer? _ticker;
@@ -283,8 +284,12 @@ class _RideScreenState extends State<RideScreen> {
     }
     _routeLine = null; // cleared above; the road route is drawn again below
     for (final p in pts) {
-      await c.addCircle(CircleOptions(
-          geometry: p, circleRadius: 6, circleColor: '#FFFFFF', circleStrokeColor: '#1B5E9E', circleStrokeWidth: 3));
+      try {
+        await c.addCircle(CircleOptions(
+            geometry: p, circleRadius: 6, circleColor: '#FFFFFF', circleStrokeColor: '#1B5E9E', circleStrokeWidth: 3));
+      } catch (e) {
+        if (mounted) setState(() => _mapError = e.toString());
+      }
     }
     await _drawRouteLine();
     if (pts.isNotEmpty && _pos == null) {
@@ -310,7 +315,8 @@ class _RideScreenState extends State<RideScreen> {
     if (_routeLine == null) {
       _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
     } else {
-      await c.updateLine(_routeLine!, LineOptions(geometry: pts));
+      await c.updateLine(_routeLine!,
+          LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
     }
   }
 
@@ -420,7 +426,8 @@ class _RideScreenState extends State<RideScreen> {
       _vehicle = await c.addCircle(CircleOptions(
           geometry: at, circleRadius: 9, circleColor: '#E53935', circleStrokeColor: '#FFFFFF', circleStrokeWidth: 3));
     } else {
-      await c.updateCircle(_vehicle!, CircleOptions(geometry: at));
+      await c.updateCircle(_vehicle!, CircleOptions(
+          geometry: at, circleRadius: 9, circleColor: '#E53935', circleStrokeColor: '#FFFFFF', circleStrokeWidth: 3));
     }
     await c.animateCamera(CameraUpdate.newLatLng(at));
   }
@@ -448,7 +455,10 @@ class _RideScreenState extends State<RideScreen> {
       text = 'Arrived early. Countdown starts at ${_clock(due)}';
     } else if (arrived) {
       text = 'At the stop';
-    } else if (_pos != null && cur.stop.location != null) {
+    } else if (cur.stop.location == null) {
+      text = 'This stop has no map position yet (its latitude / longitude are empty).';
+      color = Theme.of(context).colorScheme.error;
+    } else if (_pos != null) {
       final d = Geolocator.distanceBetween(
           _pos!.latitude, _pos!.longitude, cur.stop.location!.lat, cur.stop.location!.lng);
       text = d >= 1000 ? '${(d / 1000).toStringAsFixed(1)} km away' : '${d.round()} m away';
@@ -458,7 +468,15 @@ class _RideScreenState extends State<RideScreen> {
     } else {
       text = 'Finding your location...';
     }
-    return Text(text, style: TextStyle(fontWeight: FontWeight.w600, color: color));
+    final withPos = _stops.where((s) => s.stop.location != null).length;
+    final gps = _pos == null ? 'none yet' : 'ok (+/- ${_pos!.accuracy.round()} m)';
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(text, style: TextStyle(fontWeight: FontWeight.w600, color: color)),
+      // Temporary test line: remove once the driver flow is confirmed working.
+      Text('test info: GPS $gps, stops with map position $withPos/${_stops.length}'
+          '${_mapError == null ? '' : ', map error: $_mapError'}',
+          style: const TextStyle(fontSize: 11, color: Colors.grey)),
+    ]);
   }
 
   Widget _avatar(StudentInfo s) {
