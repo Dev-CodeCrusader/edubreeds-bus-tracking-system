@@ -57,12 +57,14 @@ jobs:
 
       - run: flutter pub get
       - run: flutter build apk --release
-      - run: flutter build web --release
 
+      # Upload the APK straight away so a web build problem never blocks it.
       - uses: actions/upload-artifact@v4
         with:
           name: release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+
+      - run: flutter build web --release
 
       - uses: actions/upload-artifact@v4
         with:
