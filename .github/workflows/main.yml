@@ -44,6 +44,19 @@ jobs:
 
       # The Android lint check crashes inside the image_picker plugin (a tooling bug, not our code).
       # Lint is not needed to produce the APK, so switch the release lint tasks off.
+      # The web map needs the MapLibre JavaScript library on the page.
+      - name: Add MapLibre to the web page
+        run: |
+          python3 - <<'EOF'
+          p = 'web/index.html'
+          s = open(p).read()
+          tags = ('  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />\n'
+                  '  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>\n')
+          if 'maplibre-gl.js' not in s:
+              s = s.replace('</head>', tags + '</head>', 1)
+          open(p, 'w').write(s)
+          EOF
+
       - name: Skip Android release lint
         run: |
           mkdir -p ~/.gradle/init.d
