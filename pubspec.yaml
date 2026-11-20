@@ -1,0 +1,23 @@
+name: edubreeds_app
+description: EDUBREEDS School Bus Tracking & Safety - single Android app for all roles
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  supabase_flutter: ^2.8.0
+  geolocator: ^13.0.0
+  maplibre_gl: ^0.21.0
+  image_picker: ^1.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
