@@ -19,9 +19,12 @@ class RoleGate extends StatelessWidget {
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
         }
         if (snap.hasError || !snap.hasData) {
+          // Show the real reason so a setup problem can be found quickly.
           return _Message(
-            title: 'Account not set up',
-            body: 'Your login works, but your account has no role yet. Ask your school admin.',
+            title: 'Could not load your account',
+            body: 'Your login works, but your profile could not be read.\n\n'
+                'Details: ${snap.error ?? 'no data'}\n\n'
+                'Signed in as: ${Supabase.instance.client.auth.currentUser?.email}',
           );
         }
         switch (snap.data!.role) {
