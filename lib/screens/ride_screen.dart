@@ -29,6 +29,7 @@ class _RideScreenState extends State<RideScreen> {
   bool _promptShown = false;
   bool _busy = false;
   String? _loadError;
+  String? _locError;
   Position? _pos;
   late final LocationService _loc;
   Timer? _ticker;
@@ -49,7 +50,10 @@ class _RideScreenState extends State<RideScreen> {
   @override
   void initState() {
     super.initState();
-    _loc = LocationService(widget.tripId, _onPosition)..start();
+    _loc = LocationService(widget.tripId, _onPosition, onError: (m) {
+      if (mounted) setState(() => _locError = m);
+    })
+      ..start();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
     _refresh();
   }
@@ -80,7 +84,10 @@ class _RideScreenState extends State<RideScreen> {
 
   void _onPosition(Position p) {
     if (!mounted) return;
-    setState(() => _pos = p);
+    setState(() {
+      _pos = p;
+      _locError = null;
+    });
     _moveVehicle(p);
     _checkArrival(p);
   }
@@ -319,6 +326,9 @@ class _RideScreenState extends State<RideScreen> {
       final d = Geolocator.distanceBetween(
           _pos!.latitude, _pos!.longitude, cur.stop.location!.lat, cur.stop.location!.lng);
       text = d >= 1000 ? '${(d / 1000).toStringAsFixed(1)} km away' : '${d.round()} m away';
+    } else if (_locError != null) {
+      text = 'Location problem: $_locError\nAllow location for this site (browser lock icon) or app, and make sure GPS is on.';
+      color = Theme.of(context).colorScheme.error;
     } else {
       text = 'Finding your location...';
     }
