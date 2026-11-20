@@ -35,17 +35,34 @@ class _RideScreenState extends State<RideScreen> {
   Position? _pos;
   late final LocationService _loc;
   Timer? _ticker;
+  int _ticks = 0;
+  LatLng? _lastCamera;
+  DateTime _lastCameraAt = DateTime.fromMillisecondsSinceEpoch(0);
+  final Map<String, Future<String?>> _photoUrls = {};
 
   MapLibreMapController? _map;
   bool _styleReady = false;
   Circle? _vehicle;
+  // navigation (see the navigation section below)
   Line? _routeLine;
-  RouteResult? _route;
-  String? _routeStopId;
-  String? _routeError;
-  bool _routing = false;
-  DateTime _lastRouteAt = DateTime.fromMillisecondsSinceEpoch(0);
+  RoutePlan? _plan;
+  bool _planning = false;
+  int _dirtyVersion = 0; // bumped when a new plan is needed (stop skipped, left the route)
+  int _planVersion = 0;
+  DateTime _lastPlanAt = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _planError;
   int _stepIdx = 0;
+  int _stepLeg = -1;
+  double? _remainM;
+  double? _remainS;
+  DateTime? _offRouteSince;
+  bool _drawingLine = false;
+  bool _lineDirty = false;
+  final List<Circle> _stopCircles = [];
+  String _stopSig = '';
+  bool _stopsBusy = false;
+  bool _stopsAgain = false;
+  bool _cameraSet = false;
 
   bool get _isPickup => widget.mode == 'pickup';
 
@@ -82,6 +99,7 @@ class _RideScreenState extends State<RideScreen> {
         _stops = s;
         _loadError = null;
       });
+      _restoreProgress();
       if (_styleReady) _drawRoute();
     } catch (e) {
       // Show the real reason, not a guess about the internet.
@@ -93,13 +111,14 @@ class _RideScreenState extends State<RideScreen> {
 
   void _onPosition(Position p) {
     if (!mounted) return;
+    _onNavPosition(p);
     setState(() {
       _pos = p;
       _locError = null;
     });
     _moveVehicle(p);
     _checkArrival(p);
-    _updateNavigation(p);
+    _ensurePlan();
   }
 
   void _checkArrival(Position p) {
@@ -120,7 +139,7 @@ class _RideScreenState extends State<RideScreen> {
   /// "Student Not Available/Ready" prompt when it runs out.
   void _tick() {
     if (!mounted) return;
-    if (_pos != null) _updateNavigation(_pos!);
+    _ensurePlan();
     final cur = _current;
     if (_isPickup && cur != null && _arrivedStops.contains(cur.stop.id) && _countdownEnd == null) {
       final due = cur.stop.scheduledToday;
@@ -133,7 +152,25 @@ class _RideScreenState extends State<RideScreen> {
       _promptShown = true;
       WidgetsBinding.instance.addPostFrameCallback((_) => _promptNotAvailable());
     }
-    setState(() {});
+    _ticks++;
+    if (_countdownEnd != null || _ticks % 5 == 0) setState(() {});
+  }
+
+  /// After a refresh or reopen the screen has forgotten which stops the van reached and any
+  /// running countdown. Rebuild both from the arrival times the server saved.
+  void _restoreProgress() {
+    for (final s in _stops) {
+      if (s.state == 'pending' && s.vanArrivedAt != null) _arrivedStops.add(s.stop.id);
+    }
+    final cur = _current;
+    if (cur != null && _isPickup && cur.vanArrivedAt != null && _countdownEnd == null) {
+      final due = cur.stop.scheduledToday;
+      final arrived = cur.vanArrivedAt!;
+      final start = (due == null || arrived.isAfter(due)) ? arrived : due; // early arrival waits for the scheduled time
+      if (!DateTime.now().isBefore(start)) {
+        _countdownEnd = start.add(const Duration(seconds: countdownSeconds));
+      }
+    }
   }
 
   void _resetForNextStudent() {
@@ -167,6 +204,7 @@ class _RideScreenState extends State<RideScreen> {
         await Api.markStop(cur.id, state);
         _resetForNextStudent();
         await _refresh();
+        if (state != 'picked_up' && state != 'dropped') _afterSkip(cur); // absent etc.: plan again
       });
 
   Future<void> _confirmAbsent() async {
@@ -242,6 +280,7 @@ class _RideScreenState extends State<RideScreen> {
         await Api.markNotAvailable(cur.id, path, pos.latitude, pos.longitude);
         _resetForNextStudent();
         await _refresh();
+        _afterSkip(cur);
       });
 
   Future<void> _finish() async {
@@ -272,41 +311,173 @@ class _RideScreenState extends State<RideScreen> {
   }
 
   Future<void> _drawRoute() async {
-    final c = _map;
-    if (c == null) return;
-    await c.clearLines();
-    await c.clearCircles();
-    _vehicle = null;
-    final seen = <String>{};
-    final pts = <LatLng>[];
-    for (final s in _stops) {
-      final l = s.stop.location;
-      if (l != null && seen.add(s.stop.id)) pts.add(LatLng(l.lat, l.lng));
-    }
-    _routeLine = null; // cleared above; the road route is drawn again below
-    for (final p in pts) {
-      try {
-        await c.addCircle(CircleOptions(
-            geometry: p, circleRadius: 6, circleColor: '#FFFFFF', circleStrokeColor: '#1B5E9E', circleStrokeWidth: 3));
-      } catch (e) {
-        if (mounted) setState(() => _mapError = e.toString());
-      }
-    }
+    if (_map == null || !_styleReady) return;
+    await _drawStops();
     await _drawRouteLine();
-    if (pts.isNotEmpty && _pos == null) {
-      await c.animateCamera(CameraUpdate.newLatLngZoom(pts.first, 14));
+    if (!_cameraSet && _pos == null) {
+      for (final s in _stops) {
+        final l = s.stop.location;
+        if (l != null) {
+          _cameraSet = true;
+          await _map!.animateCamera(CameraUpdate.newLatLngZoom(LatLng(l.lat, l.lng), 14));
+          break;
+        }
+      }
     }
     if (_pos != null) await _moveVehicle(_pos!);
   }
 
+  // ------------------------------------------------------------------ stop markers
+
+  List<String> get _pendingStopIds {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final s in _stops) {
+      if (s.state == 'pending' && seen.add(s.stop.id)) out.add(s.stop.id);
+    }
+    return out;
+  }
+
+  /// Draws only the stops still to visit (the next one larger and green). Redraws only when
+  /// that set changes, so finishing a student does not wipe and rebuild the whole map.
+  Future<void> _drawStops() async {
+    final c = _map;
+    if (c == null || !_styleReady) return;
+    if (_stopsBusy) {
+      _stopsAgain = true;
+      return;
+    }
+    _stopsBusy = true;
+    try {
+      do {
+        _stopsAgain = false;
+        final cur = _current;
+        final pending = _pendingStopIds;
+        final sig = '${cur?.stop.id}|${pending.join(',')}';
+        if (sig == _stopSig) continue;
+        _stopSig = sig;
+        final old = List<Circle>.of(_stopCircles);
+        _stopCircles.clear();
+        await Future.wait(old.map((o) => c.removeCircle(o).catchError((_) {})));
+        for (final id in pending) {
+          final st = _stops.firstWhere((x) => x.stop.id == id).stop;
+          final l = st.location;
+          if (l == null) continue;
+          final isNext = id == cur?.stop.id;
+          try {
+            _stopCircles.add(await c.addCircle(CircleOptions(
+                geometry: LatLng(l.lat, l.lng),
+                circleRadius: isNext ? 9 : 6,
+                circleColor: isNext ? '#2E7D32' : '#FFFFFF',
+                circleStrokeColor: '#1B5E9E',
+                circleStrokeWidth: 3)));
+          } catch (e) {
+            if (mounted) setState(() => _mapError = e.toString());
+          }
+        }
+      } while (_stopsAgain);
+    } finally {
+      _stopsBusy = false;
+    }
+  }
+
   // ------------------------------------------------------------------ navigation
+  //
+  // The whole journey (bus -> every pending stop, in order) is planned ONCE, with a single request.
+  // Finishing a student just moves to the next leg of that plan, so nothing is fetched after a pickup
+  // and the screen stays fast. A new plan is made only when:
+  //   - there is no plan yet,
+  //   - a stop was skipped (absent / not available / nobody at the stop), or
+  //   - the driver has left the planned route.
 
-  bool _drawingLine = false;
-  bool _lineDirty = false;
+  int get _legIdx {
+    final cur = _current;
+    final plan = _plan;
+    if (cur == null || plan == null) return -1;
+    return plan.stopIds.indexOf(cur.stop.id);
+  }
 
-  /// Redraws the blue road route. Always clears the old line and adds a fresh one (updating in
-  /// place was unreliable on the web map), and runs one redraw at a time so two quick changes
-  /// cannot leave an old line behind.
+  RouteLeg? get _leg {
+    final i = _legIdx;
+    return i < 0 ? null : _plan!.legs[i];
+  }
+
+  void _markPlanDirty() => _dirtyVersion++;
+
+  void _ensurePlan() {
+    final p = _pos;
+    if (p == null || _current == null || _planning) return;
+    final need = _plan == null || _planVersion != _dirtyVersion || _legIdx < 0;
+    if (!need) return;
+    final since = DateTime.now().difference(_lastPlanAt).inSeconds;
+    if (since < (_planError == null ? 3 : 20)) return; // be gentle with the free routing server
+
+    final stops = <StopInfo>[];
+    for (final id in _pendingStopIds) {
+      final st = _stops.firstWhere((x) => x.stop.id == id).stop;
+      if (st.location != null) stops.add(st);
+    }
+    if (stops.isEmpty) return;
+
+    _planning = true;
+    _lastPlanAt = DateTime.now();
+    final version = _dirtyVersion;
+    final ids = [for (final s in stops) s.id];
+    Routing.plan(RoutePoint(p.latitude, p.longitude), [for (final s in stops) RoutePoint(s.location!.lat, s.location!.lng)])
+        .then((legs) {
+      if (!mounted) return;
+      setState(() {
+        _plan = RoutePlan(ids, legs);
+        _planVersion = version;
+        _planError = null;
+        _stepIdx = 0;
+        _stepLeg = -1;
+        _offRouteSince = null;
+      });
+      _drawRouteLine();
+    }).catchError((Object e) {
+      if (mounted) setState(() => _planError = e.toString());
+    }).whenComplete(() => _planning = false);
+  }
+
+  /// Called for every GPS fix: remaining distance/time, the next turn, and the off-route check.
+  /// Only reads the saved plan, so it costs no network.
+  void _onNavPosition(Position p) {
+    final leg = _leg;
+    if (leg == null) return;
+    if (_stepLeg != _legIdx) {
+      _stepLeg = _legIdx;
+      _stepIdx = 0;
+    }
+    final n = leg.nearest(p.latitude, p.longitude);
+    final left = leg.remainingFrom(n.idx);
+    _remainM = left;
+    _remainS = leg.distanceM > 0 ? leg.durationS * (left / leg.distanceM) : leg.durationS;
+
+    if (n.dist > 60) {
+      _offRouteSince ??= DateTime.now();
+      final longEnough = DateTime.now().difference(_offRouteSince!).inSeconds >= 10;
+      final planOldEnough = DateTime.now().difference(_lastPlanAt).inSeconds >= 15;
+      if (longEnough && planOldEnough) {
+        _markPlanDirty(); // left the route: plan again from here
+        _offRouteSince = null;
+      }
+    } else {
+      _offRouteSince = null;
+    }
+
+    while (_stepIdx + 1 < leg.steps.length - 1) {
+      final next = leg.steps[_stepIdx + 1].at;
+      if (Geolocator.distanceBetween(p.latitude, p.longitude, next.lat, next.lng) < 25) {
+        _stepIdx++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  /// Draws the blue road line from the current leg to the last stop. Always clears and re-adds
+  /// (updating in place was unreliable on the web map), one redraw at a time.
   Future<void> _drawRouteLine() async {
     final c = _map;
     if (c == null || !_styleReady) return;
@@ -320,10 +491,13 @@ class _RideScreenState extends State<RideScreen> {
         _lineDirty = false;
         await c.clearLines();
         _routeLine = null;
-        final r = _route;
-        if (r != null && r.points.length > 1) {
-          final pts = [for (final p in r.points) LatLng(p.lat, p.lng)];
-          _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
+        final plan = _plan;
+        final i = _legIdx;
+        if (plan != null && i >= 0) {
+          final pts = [for (final p in plan.pointsFrom(i)) LatLng(p.lat, p.lng)];
+          if (pts.length > 1) {
+            _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
+          }
         }
       } while (_lineDirty);
     } catch (e) {
@@ -333,91 +507,33 @@ class _RideScreenState extends State<RideScreen> {
     }
   }
 
-  /// Fetches a road route from the bus to the next stop, redraws it when the driver leaves
-  /// the route, and moves the "next turn" along as the bus passes each manoeuvre.
-  void _updateNavigation(Position p) {
-    final cur = _current;
-    final loc = cur?.stop.location;
-    if (cur == null || loc == null || _routing) return;
-    final r = _route;
-    final since = DateTime.now().difference(_lastRouteAt).inSeconds;
-
-    var need = r == null || _routeStopId != cur.stop.id;
-    if (!need && since >= 10 && r != null) need = r.distanceFromRoute(p.latitude, p.longitude) > 60; // off route
-    if (!need && since >= 60) need = true; // refresh the time estimate
-    if (!need) {
-      _advanceStep(p);
-      return;
-    }
-    if (r != null && _routeStopId != cur.stop.id) {
-      // The next student is at a different stop: remove the old route line right away.
-      setState(() {
-        _route = null;
-        _routeError = null;
-      });
-      _drawRouteLine();
-    }
-    if (since < 5) return; // be gentle with the free routing server
-    if (r == null && _routeError != null && since < 30) return;
-
-    _routing = true;
-    _lastRouteAt = DateTime.now();
-    final stopId = cur.stop.id;
-    Routing.route(p.latitude, p.longitude, loc.lat, loc.lng).then((res) {
-      if (!mounted) return;
-      setState(() {
-        _route = res;
-        _routeStopId = stopId;
-        _routeError = null;
-        _stepIdx = 0;
-      });
-      _drawRouteLine();
-    }).catchError((Object e) {
-      if (mounted) {
-        setState(() {
-          _routeError = e.toString();
-          _routeStopId = stopId;
-        });
-      }
-    }).whenComplete(() => _routing = false);
-  }
-
-  void _advanceStep(Position p) {
-    final r = _route;
-    if (r == null) return;
-    var moved = false;
-    while (_stepIdx + 1 < r.steps.length - 1) {
-      final next = r.steps[_stepIdx + 1].at;
-      if (Geolocator.distanceBetween(p.latitude, p.longitude, next.lat, next.lng) < 25) {
-        _stepIdx++;
-        moved = true;
-      } else {
-        break;
-      }
-    }
-    if (moved && mounted) setState(() {});
+  /// After a student is skipped, a new plan is needed only if nobody else is waiting at that stop
+  /// (the stop drops out of the journey). A normal pickup never needs one.
+  void _afterSkip(TripStop skipped) {
+    final stillWaiting = _stops.any((s) => s.stop.id == skipped.stop.id && s.state == 'pending');
+    if (!stillWaiting) _markPlanDirty();
   }
 
   Widget _navBanner() {
     final cur = _current;
     if (cur == null) return const SizedBox.shrink();
-    final r = _route;
+    final leg = _leg;
     String title;
     String sub = '';
-    if (r == null) {
-      title = _routeError != null ? 'Road route unavailable' : 'Finding the best route...';
-      if (_routeError != null) sub = 'Drive to the stop shown on the map';
+    if (leg == null) {
+      title = _planError != null ? 'Road route unavailable' : 'Planning the route for all stops...';
+      if (_planError != null) sub = 'Drive to the green stop on the map';
     } else {
-      final idx = (_stepIdx + 1 < r.steps.length) ? _stepIdx + 1 : r.steps.length - 1;
-      final step = r.steps[idx];
+      final idx = (_stepIdx + 1 < leg.steps.length) ? _stepIdx + 1 : leg.steps.length - 1;
+      final step = leg.steps[idx];
       title = step.text;
       if (_pos != null) {
         final d = Geolocator.distanceBetween(_pos!.latitude, _pos!.longitude, step.at.lat, step.at.lng);
         sub = 'in ${d >= 1000 ? '${(d / 1000).toStringAsFixed(1)} km' : '${(d / 10).round() * 10} m'}  ·  ';
       }
-      final km = r.distanceM / 1000;
-      final mins = (r.durationS / 60).ceil();
-      sub += '${km.toStringAsFixed(1)} km, about $mins min to the stop';
+      final km = (_remainM ?? leg.distanceM) / 1000;
+      final mins = ((_remainS ?? leg.durationS) / 60).ceil();
+      sub += '${km.toStringAsFixed(1)} km, about $mins min to the stop  ·  ${_pendingStopIds.length} stops left';
     }
     return Material(
       elevation: 3,
@@ -450,7 +566,14 @@ class _RideScreenState extends State<RideScreen> {
       await c.updateCircle(_vehicle!, CircleOptions(
           geometry: at, circleRadius: 9, circleColor: '#E53935', circleStrokeColor: '#FFFFFF', circleStrokeWidth: 3));
     }
-    await c.animateCamera(CameraUpdate.newLatLng(at));
+    // Follow the bus, but not on every fix: a move needs 10 m and 2 s since the last one.
+    final last = _lastCamera;
+    final moved = last == null ? 999.0 : Geolocator.distanceBetween(last.latitude, last.longitude, p.latitude, p.longitude);
+    if (moved >= 10 && DateTime.now().difference(_lastCameraAt).inSeconds >= 2) {
+      _lastCamera = at;
+      _lastCameraAt = DateTime.now();
+      await c.animateCamera(CameraUpdate.newLatLng(at));
+    }
   }
 
   // ------------------------------------------------------------------ UI
@@ -505,7 +628,7 @@ class _RideScreenState extends State<RideScreen> {
     final fallback = CircleAvatar(radius: 32, child: Text(initials, style: const TextStyle(fontSize: 24)));
     if (!widget.photosEnabled || s.photoPath == null) return fallback; // privacy toggle off: initials only
     return FutureBuilder<String?>(
-      future: Api.signedUrl('student-photos', s.photoPath),
+      future: _photoUrls.putIfAbsent(s.photoPath!, () => Api.signedUrl('student-photos', s.photoPath)),
       builder: (context, snap) => snap.data == null
           ? fallback
           : CircleAvatar(radius: 32, backgroundImage: NetworkImage(snap.data!)),
