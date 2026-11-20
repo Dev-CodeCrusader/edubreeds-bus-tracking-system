@@ -28,6 +28,7 @@ class _RideScreenState extends State<RideScreen> {
   DateTime? _countdownEnd;
   bool _promptShown = false;
   bool _busy = false;
+  String? _loadError;
   Position? _pos;
   late final LocationService _loc;
   Timer? _ticker;
@@ -64,10 +65,14 @@ class _RideScreenState extends State<RideScreen> {
     try {
       final s = await Api.tripStops(widget.tripId);
       if (!mounted) return;
-      setState(() => _stops = s);
+      setState(() {
+        _stops = s;
+        _loadError = null;
+      });
       if (_styleReady) _drawRoute();
-    } catch (_) {
-      _toast('Could not refresh the list. Check your internet.');
+    } catch (e) {
+      // Show the real reason, not a guess about the internet.
+      if (mounted) setState(() => _loadError = e.toString());
     }
   }
 
@@ -334,7 +339,22 @@ class _RideScreenState extends State<RideScreen> {
 
   Widget _deck() {
     final cur = _current;
-    if (_stops.isEmpty) return const Center(child: CircularProgressIndicator());
+    if (_stops.isEmpty && _loadError != null) {
+      return Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          const Text('Could not load the stops for this trip.', style: TextStyle(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          Flexible(child: SingleChildScrollView(child: Text(_loadError!, textAlign: TextAlign.center))),
+          const SizedBox(height: 8),
+          FilledButton(onPressed: _refresh, child: const Text('Try again')),
+          TextButton(onPressed: _finish, child: const Text('End trip')),
+        ]),
+      );
+    }
+    if (_stops.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
     if (cur == null) {
       return Padding(
         padding: const EdgeInsets.all(24),
