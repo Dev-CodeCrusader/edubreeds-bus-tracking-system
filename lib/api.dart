@@ -156,7 +156,7 @@ class Api {
         .from('trip_stops')
         .select('id, state, '
             'students(id, full_name, class_name, photo_url), '
-            'stops(id, seq, name, radius_m, scheduled_time, location)')
+            'stops(id, seq, name, radius_m, scheduled_time, lat, lng)')
         .eq('trip_id', tripId);
     final list = rows.map<TripStop>((r) {
       final s = r['students'] as Map;
@@ -164,7 +164,8 @@ class Api {
       return TripStop(
         r['id'],
         r['state'],
-        StopInfo(st['id'], st['seq'], st['name'], st['radius_m'], st['scheduled_time'], GeoPoint.from(st['location'])),
+        StopInfo(st['id'], st['seq'], st['name'], st['radius_m'], st['scheduled_time'],
+            st['lat'] == null ? null : GeoPoint((st['lat'] as num).toDouble(), (st['lng'] as num).toDouble())),
         StudentInfo(s['id'], s['full_name'], s['class_name'], s['photo_url']),
       );
     }).toList();
