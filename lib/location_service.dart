@@ -11,11 +11,12 @@ import 'api.dart';
 class LocationService {
   final String tripId;
   final void Function(Position) onPosition;
+  final void Function(String)? onError;
   StreamSubscription<Position>? _sub;
   DateTime _lastLive = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastPing = DateTime.fromMillisecondsSinceEpoch(0);
 
-  LocationService(this.tripId, this.onPosition);
+  LocationService(this.tripId, this.onPosition, {this.onError});
 
   static Future<bool> ensurePermission() async {
     if (!await Geolocator.isLocationServiceEnabled()) return false;
@@ -28,7 +29,7 @@ class LocationService {
     // Android: foreground service keeps tracking alive with the screen off.
     // Web: the browser only tracks while the tab is open and the screen is on.
     final LocationSettings settings = kIsWeb
-        ? const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 5)
+        ? const LocationSettings(accuracy: LocationAccuracy.high)
         : AndroidSettings(
             accuracy: LocationAccuracy.high,
             distanceFilter: 5,
@@ -40,7 +41,16 @@ class LocationService {
               setOngoing: true,
             ),
           );
-    _sub = Geolocator.getPositionStream(locationSettings: settings).listen(_handle);
+    // One quick fix first so the screen does not sit on "finding your location".
+    Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, timeLimit: Duration(seconds: 20)),
+    ).then(_handle).catchError((Object e) {
+      onError?.call(e.toString());
+    });
+    _sub = Geolocator.getPositionStream(locationSettings: settings).listen(
+      _handle,
+      onError: (Object e) => onError?.call(e.toString()),
+    );
   }
 
   void _handle(Position p) {
