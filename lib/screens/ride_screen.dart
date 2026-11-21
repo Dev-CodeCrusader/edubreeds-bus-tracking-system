@@ -63,6 +63,13 @@ class _RideScreenState extends State<RideScreen> {
   bool _stopsBusy = false;
   bool _stopsAgain = false;
   bool _cameraSet = false;
+  bool _follow = true; // camera follows the bus (heading-up) until the driver asks for the overview
+  double _bearing = 0;
+  DateTime _lastLineAt = DateTime.fromMillisecondsSinceEpoch(0);
+  double? _totalM; // road still to drive through ALL remaining stops
+  double? _totalS;
+  Timer? _sync;
+  bool _ending = false;
 
   bool get _isPickup => widget.mode == 'pickup';
 
@@ -81,12 +88,14 @@ class _RideScreenState extends State<RideScreen> {
     })
       ..start();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
+    _sync = Timer.periodic(const Duration(seconds: 10), (_) => _syncTrip());
     _refresh();
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _sync?.cancel();
     _loc.stop();
     super.dispose();
   }
@@ -104,6 +113,33 @@ class _RideScreenState extends State<RideScreen> {
     } catch (e) {
       // Show the real reason, not a guess about the internet.
       if (mounted) setState(() => _loadError = e.toString());
+    }
+  }
+
+  String _sig(List<TripStop> l) => l.map((s) => '${s.id}:${s.state}:${s.vanArrivedAt?.millisecondsSinceEpoch}').join('|');
+
+  /// Every 10 seconds: ask the server what the trip looks like now. Keeps two phones on the same trip
+  /// in step, notices a parent's absence notice, and leaves the screen if the trip was ended elsewhere.
+  Future<void> _syncTrip() async {
+    if (_busy || _ending || !mounted) return;
+    try {
+      final state = await Api.tripState(widget.tripId);
+      if (!mounted || _ending) return;
+      if (state != null && state != 'active') {
+        _ending = true;
+        _toast('This trip has ended.');
+        Navigator.of(context).pop();
+        return;
+      }
+      final s = await Api.tripStops(widget.tripId);
+      if (!mounted || _busy || _sig(s) == _sig(_stops)) return;
+      final before = _current?.id;
+      setState(() => _stops = s);
+      if (_current?.id != before) _resetForNextStudent();
+      _restoreProgress();
+      if (_styleReady) _drawRoute();
+    } catch (_) {
+      // offline for a moment; the next round retries
     }
   }
 
@@ -296,11 +332,13 @@ class _RideScreenState extends State<RideScreen> {
       ),
     );
     if (ok != true) return;
+    _ending = true;
     await _run(() async {
       await _loc.stop();
       await Api.finishTrip(widget.tripId);
       if (mounted) Navigator.of(context).pop();
     });
+    if (mounted && _ending) _ending = false; // the end did not go through
   }
 
   // ------------------------------------------------------------------ map
@@ -404,10 +442,26 @@ class _RideScreenState extends State<RideScreen> {
 
   void _markPlanDirty() => _dirtyVersion++;
 
+  /// The plan is still good when the stops still waiting are exactly the last stops of the plan.
+  bool _planMatches() {
+    final plan = _plan;
+    if (plan == null) return false;
+    final pend = <String>[
+      for (final id in _pendingStopIds)
+        if (_stops.firstWhere((x) => x.stop.id == id).stop.location != null) id
+    ];
+    if (pend.length > plan.stopIds.length) return false;
+    final tail = plan.stopIds.sublist(plan.stopIds.length - pend.length);
+    for (var i = 0; i < pend.length; i++) {
+      if (tail[i] != pend[i]) return false;
+    }
+    return true;
+  }
+
   void _ensurePlan() {
     final p = _pos;
     if (p == null || _current == null || _planning) return;
-    final need = _plan == null || _planVersion != _dirtyVersion || _legIdx < 0;
+    final need = _plan == null || _planVersion != _dirtyVersion || _legIdx < 0 || !_planMatches();
     if (!need) return;
     final since = DateTime.now().difference(_lastPlanAt).inSeconds;
     if (since < (_planError == null ? 3 : 20)) return; // be gentle with the free routing server
@@ -453,6 +507,20 @@ class _RideScreenState extends State<RideScreen> {
     final left = leg.remainingFrom(n.idx);
     _remainM = left;
     _remainS = leg.distanceM > 0 ? leg.durationS * (left / leg.distanceM) : leg.durationS;
+    // everything still to drive: the rest of this leg plus every later leg
+    var tm = left, ts = _remainS ?? 0;
+    final plan = _plan!;
+    for (var i = _legIdx + 1; i < plan.legs.length; i++) {
+      tm += plan.legs[i].distanceM;
+      ts += plan.legs[i].durationS;
+    }
+    _totalM = tm;
+    _totalS = ts;
+    // keep the blue line starting at the bus: redraw every few seconds while moving
+    if (DateTime.now().difference(_lastLineAt).inSeconds >= 4) {
+      _lastLineAt = DateTime.now();
+      _drawRouteLine();
+    }
 
     if (n.dist > 60) {
       _offRouteSince ??= DateTime.now();
@@ -494,7 +562,26 @@ class _RideScreenState extends State<RideScreen> {
         final plan = _plan;
         final i = _legIdx;
         if (plan != null && i >= 0) {
-          final pts = [for (final p in plan.pointsFrom(i)) LatLng(p.lat, p.lng)];
+          final pts = <LatLng>[];
+          final here = _pos;
+          final leg = plan.legs[i];
+          if (here != null) {
+            // the bus -> the rest of the current leg -> every later leg
+            pts.add(LatLng(here.latitude, here.longitude));
+            final from = leg.nearest(here.latitude, here.longitude).idx;
+            for (var k = from; k < leg.points.length; k++) {
+              pts.add(LatLng(leg.points[k].lat, leg.points[k].lng));
+            }
+            for (var j = i + 1; j < plan.legs.length; j++) {
+              for (final p in plan.legs[j].points) {
+                pts.add(LatLng(p.lat, p.lng));
+              }
+            }
+          } else {
+            for (final p in plan.pointsFrom(i)) {
+              pts.add(LatLng(p.lat, p.lng));
+            }
+          }
           if (pts.length > 1) {
             _routeLine = await c.addLine(LineOptions(geometry: pts, lineColor: '#1B5E9E', lineWidth: 5, lineOpacity: 0.85));
           }
@@ -521,8 +608,10 @@ class _RideScreenState extends State<RideScreen> {
     String title;
     String sub = '';
     if (leg == null) {
-      title = _planError != null ? 'Road route unavailable' : 'Planning the route for all stops...';
-      if (_planError != null) sub = 'Drive to the green stop on the map';
+      title = _pos == null
+          ? 'Waiting for your location...'
+          : (_planError != null ? 'Road route unavailable' : 'Planning the route for all stops...');
+      if (_planError != null) sub = 'Drive to the green stop on the map. ($_planError)';
     } else {
       final idx = (_stepIdx + 1 < leg.steps.length) ? _stepIdx + 1 : leg.steps.length - 1;
       final step = leg.steps[idx];
@@ -533,7 +622,13 @@ class _RideScreenState extends State<RideScreen> {
       }
       final km = (_remainM ?? leg.distanceM) / 1000;
       final mins = ((_remainS ?? leg.durationS) / 60).ceil();
-      sub += '${km.toStringAsFixed(1)} km, about $mins min to the stop  ·  ${_pendingStopIds.length} stops left';
+      sub += '${km.toStringAsFixed(1)} km, about $mins min to the stop';
+      final n = _pendingStopIds.length;
+      if (n > 1 && _totalM != null) {
+        sub += '\nAll $n stops: ${(_totalM! / 1000).toStringAsFixed(1)} km, about ${((_totalS ?? 0) / 60).ceil()} min';
+      } else {
+        sub += '  ·  $n stop left';
+      }
     }
     return Material(
       elevation: 3,
@@ -566,14 +661,52 @@ class _RideScreenState extends State<RideScreen> {
       await c.updateCircle(_vehicle!, CircleOptions(
           geometry: at, circleRadius: 9, circleColor: '#E53935', circleStrokeColor: '#FFFFFF', circleStrokeWidth: 3));
     }
-    // Follow the bus, but not on every fix: a move needs 10 m and 2 s since the last one.
+    // Follow the bus like a navigation app: heading-up and slightly tilted, but not on every fix.
+    if (p.speed > 1.5 && p.heading.isFinite) _bearing = p.heading;
+    if (!_follow) return;
     final last = _lastCamera;
     final moved = last == null ? 999.0 : Geolocator.distanceBetween(last.latitude, last.longitude, p.latitude, p.longitude);
-    if (moved >= 10 && DateTime.now().difference(_lastCameraAt).inSeconds >= 2) {
+    if (moved >= 5 && DateTime.now().difference(_lastCameraAt).inMilliseconds >= 1200) {
       _lastCamera = at;
       _lastCameraAt = DateTime.now();
-      await c.animateCamera(CameraUpdate.newLatLng(at));
+      await c.animateCamera(CameraUpdate.newCameraPosition(
+          CameraPosition(target: at, zoom: 16.5, bearing: _bearing, tilt: 45)));
     }
+  }
+
+  /// Zoom out to see the bus and every remaining stop.
+  Future<void> _overview() async {
+    final c = _map;
+    if (c == null) return;
+    setState(() => _follow = false);
+    final pts = <LatLng>[
+      if (_pos != null) LatLng(_pos!.latitude, _pos!.longitude),
+      for (final id in _pendingStopIds)
+        if (_stops.firstWhere((x) => x.stop.id == id).stop.location != null)
+          LatLng(_stops.firstWhere((x) => x.stop.id == id).stop.location!.lat,
+              _stops.firstWhere((x) => x.stop.id == id).stop.location!.lng),
+    ];
+    if (pts.isEmpty) return;
+    var minLat = pts.first.latitude, maxLat = minLat, minLng = pts.first.longitude, maxLng = minLng;
+    for (final p in pts) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLng) minLng = p.longitude;
+      if (p.longitude > maxLng) maxLng = p.longitude;
+    }
+    if (maxLat - minLat < 0.0005 && maxLng - minLng < 0.0005) {
+      await c.animateCamera(CameraUpdate.newCameraPosition(CameraPosition(target: pts.first, zoom: 16, bearing: 0, tilt: 0)));
+      return;
+    }
+    await c.animateCamera(CameraUpdate.newLatLngBounds(
+        LatLngBounds(southwest: LatLng(minLat, minLng), northeast: LatLng(maxLat, maxLng)),
+        left: 50, right: 50, top: 110, bottom: 40));
+  }
+
+  Future<void> _recenter() async {
+    setState(() => _follow = true);
+    _lastCameraAt = DateTime.fromMillisecondsSinceEpoch(0);
+    if (_pos != null) await _moveVehicle(_pos!);
   }
 
   // ------------------------------------------------------------------ UI
@@ -747,6 +880,27 @@ class _RideScreenState extends State<RideScreen> {
                   compassEnabled: false,
                 ),
                 Positioned(top: 8, left: 8, right: 8, child: _navBanner()),
+                Positioned(
+                  right: 8,
+                  bottom: 8,
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    FloatingActionButton.small(
+                      heroTag: 'overview',
+                      tooltip: 'Show all stops',
+                      onPressed: _overview,
+                      child: const Icon(Icons.zoom_out_map),
+                    ),
+                    const SizedBox(height: 8),
+                    FloatingActionButton.small(
+                      heroTag: 'follow',
+                      tooltip: 'Follow the bus',
+                      backgroundColor: _follow ? Theme.of(context).colorScheme.primary : null,
+                      foregroundColor: _follow ? Theme.of(context).colorScheme.onPrimary : null,
+                      onPressed: _recenter,
+                      child: const Icon(Icons.navigation),
+                    ),
+                  ]),
+                ),
               ]),
             ),
             const Divider(height: 1),

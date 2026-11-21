@@ -29,6 +29,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _loading = true;
   bool _starting = false;
   bool _resumeChecked = false;
+  Map<String, dynamic>? _active; // the trip already running on the server for this driver
+  String? _activeError;
   String? _error;
 
   @override
@@ -47,7 +49,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _loading = false;
       });
       _pickDefaultRoute();
-      _resumeActiveTrip();
+      await _loadActive(autoOpen: true);
     } catch (e) {
       setState(() {
         _error = 'Could not load your routes. Pull down to retry.';
@@ -56,24 +58,77 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// If the driver already has a trip running (page refreshed, app closed and reopened),
-  /// go straight back to it instead of starting over.
-  Future<void> _resumeActiveTrip() async {
-    if (_resumeChecked) return;
-    _resumeChecked = true;
+  /// The trip lives on the server, so it survives a refresh, a closed app, a sign-out and a different phone.
+  /// Whenever this screen opens it asks the server for the driver's running trip and offers to continue it.
+  Future<void> _loadActive({bool autoOpen = false}) async {
     try {
       final t = await Api.activeTrip();
-      if (t == null || !mounted) return;
-      await LocationService.ensurePermission();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Resuming your trip...')));
-      await Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => RideScreen(
-            tripId: t['id'] as String, mode: t['mode'] as String, photosEnabled: _me?.photosEnabled ?? true),
-      ));
-    } catch (_) {
-      // If the check fails the driver can still start normally.
+      setState(() {
+        _active = t;
+        _activeError = null;
+      });
+      if (t != null && autoOpen && !_resumeChecked) {
+        _resumeChecked = true;
+        await _openActive();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _activeError = 'Could not check for a running trip. $e');
     }
+  }
+
+  Future<void> _openActive() async {
+    final t = _active;
+    if (t == null || !mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => RideScreen(
+          tripId: t['id'] as String, mode: t['mode'] as String, photosEnabled: _me?.photosEnabled ?? true),
+    ));
+    if (mounted) _loadActive();
+  }
+
+  Future<void> _endActive() async {
+    final t = _active;
+    if (t == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('End the running trip?'),
+        content: const Text('Use this only if the trip was started by mistake or is already over. '
+            'Parents will stop seeing the bus.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('End trip')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await Api.finishTrip(t['id'] as String);
+      if (mounted) setState(() => _active = null);
+    } catch (e) {
+      if (mounted) setState(() => _activeError = 'Could not end the trip. $e');
+    }
+  }
+
+  Future<void> _signOut() async {
+    if (_active != null) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('Sign out?'),
+          content: const Text('Your trip stays open. Sign in again on this or another phone to continue it. '
+              'Parents will not see live bus movement while nobody is signed in on the trip.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Stay')),
+            FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Sign out')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    await Supabase.instance.client.auth.signOut();
   }
 
   List<RouteInfo> get _modeRoutes => _routes.where((r) => r.mode == _mode).toList();
@@ -108,7 +163,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   bool get _ready =>
-      _route != null && _selfie != null && (_mode == 'pickup' || _inVan.isNotEmpty) && !_starting;
+      _active == null && _activeError == null && _route != null && _selfie != null && (_mode == 'pickup' || _inVan.isNotEmpty) && !_starting;
 
   Future<void> _start() async {
     setState(() {
@@ -116,6 +171,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _error = null;
     });
     try {
+      if (_active != null) throw 'A trip is already running. Continue it or end it first.';
       if (!await LocationService.ensurePermission()) {
         throw 'Location permission is needed to share the bus position. Allow it in Settings.';
       }
@@ -133,6 +189,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _selfie = null;
         _selfieBytes = null;
       });
+      _loadActive();
     } catch (e) {
       setState(() => _error = e is String ? e : 'Could not start the trip. Please try again.');
     } finally {
@@ -149,7 +206,7 @@ class _HomeScreenState extends State<HomeScreen> {
           IconButton(
             tooltip: 'Sign out',
             icon: const Icon(Icons.logout),
-            onPressed: () => Supabase.instance.client.auth.signOut(),
+            onPressed: _signOut,
           ),
         ],
       ),
@@ -162,6 +219,39 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   if (_me != null) Text('Hello, ${_me!.fullName}', style: Theme.of(context).textTheme.titleLarge),
                   const SizedBox(height: 16),
+                  if (_activeError != null)
+                    Card(
+                      color: Theme.of(context).colorScheme.errorContainer,
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(_activeError!),
+                          const SizedBox(height: 8),
+                          OutlinedButton(onPressed: () => _loadActive(), child: const Text('Try again')),
+                        ]),
+                      ),
+                    ),
+                  if (_active != null) ...[
+                    Card(
+                      color: Colors.orange.shade50,
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('Trip in progress', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 4),
+                          Text('${(_active!['routes'] as Map?)?['name'] ?? 'Route'}  (${_active!['mode'] == 'drop' ? 'Drop' : 'Pickup'})'),
+                          const SizedBox(height: 12),
+                          FilledButton.icon(
+                            onPressed: _openActive,
+                            icon: const Icon(Icons.play_arrow),
+                            label: const Padding(padding: EdgeInsets.symmetric(vertical: 10), child: Text('Continue trip')),
+                          ),
+                          const SizedBox(height: 8),
+                          TextButton(onPressed: _endActive, child: const Text('End this trip')),
+                        ]),
+                      ),
+                    ),
+                  ] else ...[
                   SegmentedButton<String>(
                     segments: const [
                       ButtonSegment(value: 'pickup', label: Text('Pickup'), icon: Icon(Icons.login)),
@@ -236,6 +326,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(height: 8),
                   const Text('Starting notifies parents that school transportation has started.',
                       textAlign: TextAlign.center),
+                  ],
                 ],
               ),
             ),

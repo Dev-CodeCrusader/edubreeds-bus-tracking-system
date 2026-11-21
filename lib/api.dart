@@ -161,13 +161,19 @@ class Api {
     final since = DateTime.now().toUtc().subtract(const Duration(hours: 14)).toIso8601String();
     final rows = await db
         .from('trips')
-        .select('id, mode')
+        .select('id, mode, started_at, routes(name)')
         .eq('driver_id', uid)
         .eq('state', 'active')
         .gte('started_at', since)
         .order('started_at', ascending: false)
         .limit(1);
     return rows.isEmpty ? null : Map<String, dynamic>.from(rows.first);
+  }
+
+  /// 'active' | 'completed' | 'cancelled', or null if the trip cannot be read.
+  static Future<String?> tripState(String tripId) async {
+    final r = await db.from('trips').select('state').eq('id', tripId).maybeSingle();
+    return r?['state']?.toString();
   }
 
   static Future<List<TripStop>> tripStops(String tripId) async {
