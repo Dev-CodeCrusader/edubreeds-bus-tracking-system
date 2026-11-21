@@ -46,7 +46,7 @@ class _FleetTabState extends State<FleetTab> {
       final sid = widget.me.schoolId!;
       final r = await db
           .from('routes')
-          .select('id, name, mode, bus_id, school_arrival, school_lat, school_lng, buses(reg_no), stops(count)')
+          .select('id, name, mode, bus_id, start_time, days, school_arrival, school_lat, school_lng, buses(reg_no), stops(count)')
           .eq('school_id', sid)
           .order('name');
       final b = await db.from('buses').select('id, reg_no, capacity, driver_id, profiles(full_name)').eq('school_id', sid).order('reg_no');
@@ -184,7 +184,7 @@ class _FleetTabState extends State<FleetTab> {
         return ListTile(
           leading: Icon(r['mode'] == 'drop' ? Icons.home : Icons.school),
           title: Text(r['name'].toString()),
-          subtitle: Text('${r['mode'] == 'drop' ? 'Drop' : 'Pickup'}  |  $n stops  |  ${bus ?? 'no bus'}'),
+          subtitle: Text('${r['mode'] == 'drop' ? 'Drop' : 'Pickup'}  |  ${r['start_time'] == null ? 'no start time' : _hhmm(r['start_time'])}  |  $n stops  |  ${bus ?? 'no bus'}'),
           trailing: const Icon(Icons.chevron_right),
           onTap: () => _openRoute(r),
         );
@@ -230,6 +230,8 @@ class _RouteScreenState extends State<RouteScreen> {
   String _mode = 'pickup';
   String? _bus;
   TimeOfDay? _arrival;
+  TimeOfDay? _startT; // scheduled start of the trip
+  Set<int> _days = {1, 2, 3, 4, 5, 6}; // 1 = Monday ... 7 = Sunday
   LatLng? _school;
   bool _saving = false;
   List<Map<String, dynamic>> _stops = [];
@@ -243,6 +245,8 @@ class _RouteScreenState extends State<RouteScreen> {
       _mode = r['mode'].toString();
       _bus = r['bus_id']?.toString();
       _arrival = _toTime(r['school_arrival']);
+      _startT = _toTime(r['start_time']);
+      if (r['days'] is List) _days = (r['days'] as List).map((e) => (e as num).toInt()).toSet();
       if (r['school_lat'] != null) _school = LatLng((r['school_lat'] as num).toDouble(), (r['school_lng'] as num).toDouble());
       _loadStops();
     }
@@ -280,6 +284,8 @@ class _RouteScreenState extends State<RouteScreen> {
         'mode': _mode,
         'bus_id': _bus,
         'school_arrival': _arrival == null ? null : _fromTime(_arrival!),
+        'start_time': _startT == null ? null : _fromTime(_startT!),
+        'days': (_days.toList()..sort()),
         'school_location': _school == null ? null : AdminApi.point(_school!.latitude, _school!.longitude),
       };
       if (_id == null) {
@@ -443,6 +449,25 @@ class _RouteScreenState extends State<RouteScreen> {
           ],
           onChanged: (v) => setState(() => _bus = v),
         ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.alarm),
+          label: Text(_startT == null ? 'Trip start time (when the driver leaves)' : 'Trip starts ${two(_startT!.hour)}:${two(_startT!.minute)}'),
+          onPressed: () async {
+            final t = await showTimePicker(context: context, initialTime: _startT ?? const TimeOfDay(hour: 7, minute: 0));
+            if (t != null) setState(() => _startT = t);
+          },
+        ),
+        const SizedBox(height: 8),
+        const Text('Runs on', style: TextStyle(fontWeight: FontWeight.w600)),
+        Wrap(spacing: 6, children: [
+          for (final e in const {1: 'Mon', 2: 'Tue', 3: 'Wed', 4: 'Thu', 5: 'Fri', 6: 'Sat', 7: 'Sun'}.entries)
+            FilterChip(
+              label: Text(e.value),
+              selected: _days.contains(e.key),
+              onSelected: (v) => setState(() => v ? _days.add(e.key) : _days.remove(e.key)),
+            ),
+        ]),
         const SizedBox(height: 8),
         Wrap(spacing: 8, children: [
           OutlinedButton.icon(

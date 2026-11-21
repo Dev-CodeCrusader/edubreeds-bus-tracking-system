@@ -73,6 +73,10 @@ class _RideScreenState extends State<RideScreen> {
   Timer? _sync;
   bool _ending = false;
   bool _offline = false;
+  GeoPoint? _school; // the school: last stop on a pickup, starting point of a drop
+  bool _reachedReported = false;
+  bool _leftReported = false;
+  final Set<String> _approachSent = {};
   String _spoken = '';
 
   bool get _isPickup => widget.mode == 'pickup';
@@ -97,6 +101,11 @@ class _RideScreenState extends State<RideScreen> {
     } catch (_) {}
     _sync = Timer.periodic(const Duration(seconds: 10), (_) => _syncTrip());
     _refresh();
+    Api.tripSchool(widget.tripId).then((sp) {
+      if (!mounted) return;
+      setState(() => _school = sp.at);
+      if (_styleReady) _drawRoute();
+    }).catchError((_) {});
   }
 
   @override
@@ -167,14 +176,53 @@ class _RideScreenState extends State<RideScreen> {
     });
     _moveVehicle(p);
     _checkArrival(p);
+    _checkSchool(p);
     _ensurePlan();
+  }
+
+  /// School milestones: pickup ends at the school; a drop starts at the school.
+  void _checkSchool(Position p) {
+    final sc = _school;
+    if (sc == null || _ending) return;
+    final d = Geolocator.distanceBetween(p.latitude, p.longitude, sc.lat, sc.lng);
+    if (_isPickup) {
+      if (_stops.isNotEmpty && _current == null && !_reachedReported && d <= schoolRadiusM) {
+        _reachedReported = true;
+        Api.markSchoolReached(widget.tripId).then((_) => _onSchoolReached()).catchError((_) {
+          _reachedReported = false; // retry on the next fix
+        });
+      }
+    } else if (!_leftReported && d >= leftSchoolM) {
+      _leftReported = true;
+      Api.markLeftSchool(widget.tripId).catchError((_) {
+        _leftReported = false;
+      });
+    }
+  }
+
+  Future<void> _onSchoolReached() async {
+    if (!mounted || _ending) return;
+    _ending = true; // the server already finished the trip
+    Voice.speak('You have reached the school.');
+    await _loc.stop();
+    await _refresh();
+    if (mounted) await _showSummary();
+    if (mounted) Navigator.of(context).pop();
   }
 
   void _checkArrival(Position p) {
     final cur = _current;
     final loc = cur?.stop.location;
-    if (cur == null || loc == null || _arrivedStops.contains(cur.stop.id)) return;
+    if (cur == null || loc == null) return;
     final d = Geolocator.distanceBetween(p.latitude, p.longitude, loc.lat, loc.lng);
+    // close to the stop: tell the parent "van is arriving, get ready" (once per stop)
+    if (d <= approachMeters && !_approachSent.contains(cur.stop.id)) {
+      _approachSent.add(cur.stop.id);
+      Api.markApproaching(widget.tripId, cur.stop.id).catchError((_) {
+        _approachSent.remove(cur.stop.id);
+      });
+    }
+    if (_arrivedStops.contains(cur.stop.id)) return;
     if (d <= cur.stop.radiusM) {
       _arrivedStops.add(cur.stop.id);
       // Server notifies the parent(s): arrival buzz.
@@ -430,7 +478,7 @@ class _RideScreenState extends State<RideScreen> {
         _stopsAgain = false;
         final cur = _current;
         final pending = _pendingStopIds;
-        final sig = '${cur?.stop.id}|${pending.join(',')}';
+        final sig = '${cur?.stop.id}|${pending.join(',')}|${_school == null ? '' : '${_school!.lat},${_school!.lng}'}';
         if (sig == _stopSig) continue;
         _stopSig = sig;
         final old = List<Circle>.of(_stopCircles);
@@ -452,6 +500,17 @@ class _RideScreenState extends State<RideScreen> {
             if (mounted) setState(() => _mapError = e.toString());
           }
         }
+        final sc = _school;
+        if (sc != null) {
+          try {
+            _stopCircles.add(await c.addCircle(CircleOptions(
+                geometry: LatLng(sc.lat, sc.lng),
+                circleRadius: 10,
+                circleColor: '#6A1B9A',
+                circleStrokeColor: '#FFFFFF',
+                circleStrokeWidth: 3)));
+          } catch (_) {}
+        }
       } while (_stopsAgain);
     } finally {
       _stopsBusy = false;
@@ -467,11 +526,29 @@ class _RideScreenState extends State<RideScreen> {
   //   - a stop was skipped (absent / not available / nobody at the stop), or
   //   - the driver has left the planned route.
 
+  /// Where the bus must still go, in order: stops with students waiting, then (pickup) the school.
+  List<({String id, String name, double lat, double lng})> _navTargets() {
+    final out = <({String id, String name, double lat, double lng})>[];
+    for (final id in _pendingStopIds) {
+      final st = _stops.firstWhere((x) => x.stop.id == id).stop;
+      final l = st.location;
+      if (l != null) out.add((id: st.id, name: st.name, lat: l.lat, lng: l.lng));
+    }
+    final sc = _school;
+    if (_isPickup && sc != null) out.add((id: '__school__', name: 'School', lat: sc.lat, lng: sc.lng));
+    return out;
+  }
+
+  String? get _nextNavId {
+    final t = _navTargets();
+    return t.isEmpty ? null : t.first.id;
+  }
+
   int get _legIdx {
-    final cur = _current;
+    final id = _nextNavId;
     final plan = _plan;
-    if (cur == null || plan == null) return -1;
-    return plan.stopIds.indexOf(cur.stop.id);
+    if (id == null || plan == null) return -1;
+    return plan.stopIds.indexOf(id);
   }
 
   RouteLeg? get _leg {
@@ -485,10 +562,7 @@ class _RideScreenState extends State<RideScreen> {
   bool _planMatches() {
     final plan = _plan;
     if (plan == null) return false;
-    final pend = <String>[
-      for (final id in _pendingStopIds)
-        if (_stops.firstWhere((x) => x.stop.id == id).stop.location != null) id
-    ];
+    final pend = <String>[for (final t in _navTargets()) t.id];
     if (pend.length > plan.stopIds.length) return false;
     final tail = plan.stopIds.sublist(plan.stopIds.length - pend.length);
     for (var i = 0; i < pend.length; i++) {
@@ -499,24 +573,20 @@ class _RideScreenState extends State<RideScreen> {
 
   void _ensurePlan() {
     final p = _pos;
-    if (p == null || _current == null || _planning) return;
+    if (p == null || _nextNavId == null || _planning) return;
     final need = _plan == null || _planVersion != _dirtyVersion || _legIdx < 0 || !_planMatches();
     if (!need) return;
     final since = DateTime.now().difference(_lastPlanAt).inSeconds;
     if (since < (_planError == null ? 3 : 20)) return; // be gentle with the free routing server
 
-    final stops = <StopInfo>[];
-    for (final id in _pendingStopIds) {
-      final st = _stops.firstWhere((x) => x.stop.id == id).stop;
-      if (st.location != null) stops.add(st);
-    }
-    if (stops.isEmpty) return;
+    final targets = _navTargets();
+    if (targets.isEmpty) return;
 
     _planning = true;
     _lastPlanAt = DateTime.now();
     final version = _dirtyVersion;
-    final ids = [for (final s in stops) s.id];
-    Routing.plan(RoutePoint(p.latitude, p.longitude), [for (final s in stops) RoutePoint(s.location!.lat, s.location!.lng)])
+    final ids = [for (final t in targets) t.id];
+    Routing.plan(RoutePoint(p.latitude, p.longitude), [for (final t in targets) RoutePoint(t.lat, t.lng)])
         .then((legs) {
       if (!mounted) return;
       setState(() {
@@ -580,7 +650,8 @@ class _RideScreenState extends State<RideScreen> {
     final key = '$_legIdx:$nextIdx';
     if (dNext < 250 && _spoken != key) {
       _spoken = key;
-      Voice.speak(dNext < 40 ? nextStep.text : 'In ${(dNext / 10).round() * 10} metres, ${nextStep.text}');
+      final say = (nextStep.text.contains('arrived at the stop') && _nextNavId == '__school__') ? 'You have arrived at the school' : nextStep.text;
+      Voice.speak(dNext < 40 ? say : 'In ${(dNext / 10).round() * 10} metres, $say');
     }
     while (_stepIdx + 1 < leg.steps.length - 1) {
       final next = leg.steps[_stepIdx + 1].at;
@@ -650,8 +721,7 @@ class _RideScreenState extends State<RideScreen> {
   }
 
   Widget _navBanner() {
-    final cur = _current;
-    if (cur == null) return const SizedBox.shrink();
+    if (_nextNavId == null) return const SizedBox.shrink();
     final leg = _leg;
     String title;
     String sub = '';
@@ -663,15 +733,15 @@ class _RideScreenState extends State<RideScreen> {
     } else {
       final idx = (_stepIdx + 1 < leg.steps.length) ? _stepIdx + 1 : leg.steps.length - 1;
       final step = leg.steps[idx];
-      title = step.text;
+      title = (step.text.contains('arrived at the stop') && _nextNavId == '__school__') ? 'You have arrived at the school' : step.text;
       if (_pos != null) {
         final d = Geolocator.distanceBetween(_pos!.latitude, _pos!.longitude, step.at.lat, step.at.lng);
         sub = 'in ${d >= 1000 ? '${(d / 1000).toStringAsFixed(1)} km' : '${(d / 10).round() * 10} m'}  ·  ';
       }
       final km = (_remainM ?? leg.distanceM) / 1000;
       final mins = ((_remainS ?? leg.durationS) / 60).ceil();
-      sub += '${km.toStringAsFixed(1)} km, about $mins min to the stop';
-      final n = _pendingStopIds.length;
+      sub += '${km.toStringAsFixed(1)} km, about $mins min to ${_nextNavId == '__school__' ? 'the school' : 'the stop'}';
+      final n = _navTargets().length;
       if (n > 1 && _totalM != null) {
         sub += '\nAll $n stops: ${(_totalM! / 1000).toStringAsFixed(1)} km, about ${((_totalS ?? 0) / 60).ceil()} min';
       } else {
@@ -729,6 +799,7 @@ class _RideScreenState extends State<RideScreen> {
     setState(() => _follow = false);
     final pts = <LatLng>[
       if (_pos != null) LatLng(_pos!.latitude, _pos!.longitude),
+      if (_school != null) LatLng(_school!.lat, _school!.lng),
       for (final id in _pendingStopIds)
         if (_stops.firstWhere((x) => x.stop.id == id).stop.location != null)
           LatLng(_stops.firstWhere((x) => x.stop.id == id).stop.location!.lat,
@@ -838,7 +909,11 @@ class _RideScreenState extends State<RideScreen> {
           children: [
             const Icon(Icons.check_circle, size: 56, color: Colors.green),
             const SizedBox(height: 8),
-            Text(_isPickup ? 'All students handled. Head to school.' : 'All drops are done.',
+            Text(_isPickup
+                    ? (_school != null
+                        ? 'All students handled. Drive to the school (purple dot). The trip ends by itself when you arrive.'
+                        : 'All students handled. Head to school.')
+                    : 'All drops are done.',
                 style: Theme.of(context).textTheme.titleMedium, textAlign: TextAlign.center),
             const SizedBox(height: 16),
             FilledButton(onPressed: _busy ? null : _finish, child: const Text('End trip')),

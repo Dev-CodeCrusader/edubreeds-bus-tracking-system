@@ -19,6 +19,8 @@ class LiveTripsView extends StatefulWidget {
 class _LiveTripsViewState extends State<LiveTripsView> {
   List<Map<String, dynamic>> _trips = [];
   Map<String, Map<String, int>> _counts = {};
+  List<Map<String, dynamic>> _scheduled = []; // routes due today that have not started
+  String? _holiday;
   bool _loading = true;
   String? _error;
   Timer? _timer;
@@ -43,7 +45,7 @@ class _LiveTripsViewState extends State<LiveTripsView> {
       final since = DateTime(now.year, now.month, now.day).toUtc().toIso8601String();
       final t = await db
           .from('trips')
-          .select('id, mode, state, started_at, ended_at, profiles(full_name), routes(name, buses(reg_no))')
+          .select('id, route_id, mode, state, started_at, ended_at, profiles(full_name), routes(name, buses(reg_no))')
           .eq('school_id', widget.me.schoolId!)
           .gte('started_at', since)
           .order('started_at', ascending: false);
@@ -58,8 +60,22 @@ class _LiveTripsViewState extends State<LiveTripsView> {
           m[s] = (m[s] ?? 0) + 1;
         }
       }
+      // today's schedule: routes that run today and have no trip yet
+      final rt = await db.from('routes').select('id, name, mode, start_time, days, buses(reg_no)').eq('school_id', widget.me.schoolId!);
+      final hol = await db.from('holidays').select('reason').eq('on_date', istDate()).maybeSingle();
+      final wd = DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30)).weekday;
+      final started = trips.map((e) => e['route_id'].toString()).toSet();
+      final due = rt
+          .map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e))
+          .where((r) =>
+              !started.contains(r['id'].toString()) &&
+              (r['days'] is List ? (r['days'] as List).map((e) => (e as num).toInt()).contains(wd) : true))
+          .toList()
+        ..sort((a, b) => (a['start_time'] ?? '99:99').toString().compareTo((b['start_time'] ?? '99:99').toString()));
       if (!mounted) return;
       setState(() {
+        _scheduled = due;
+        _holiday = hol == null ? null : ((hol['reason'] ?? 'Holiday').toString());
         _trips = trips;
         _counts = counts;
         _loading = false;
@@ -78,42 +94,65 @@ class _LiveTripsViewState extends State<LiveTripsView> {
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_error != null) return Center(child: Text('Could not load: $_error'));
-    if (_trips.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: _load,
-        child: ListView(children: const [Padding(padding: EdgeInsets.all(32), child: Center(child: Text('No trips today yet.')))]),
-      );
+    final children = <Widget>[];
+    if (_holiday != null) {
+      children.add(Card(
+        color: Colors.red.shade50,
+        child: ListTile(
+          leading: const Icon(Icons.beach_access, color: Colors.red),
+          title: Text('Holiday today: $_holiday'),
+          subtitle: const Text('No trips are scheduled.'),
+        ),
+      ));
+    } else {
+      final nowIst = DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30));
+      for (final r in _scheduled) {
+        final st = r['start_time']?.toString();
+        String? label;
+        var late = false;
+        if (st != null) {
+          final p = st.split(':');
+          final due = DateTime.utc(nowIst.year, nowIst.month, nowIst.day, int.parse(p[0]), int.parse(p[1]));
+          label = '${p[0]}:${p[1]}';
+          late = nowIst.difference(due).inMinutes >= 10;
+        }
+        final bus = (r['buses'] as Map?)?['reg_no'];
+        children.add(Card(
+          color: late ? Colors.orange.shade50 : null,
+          child: ListTile(
+            leading: Icon(r['mode'] == 'drop' ? Icons.home : Icons.school, color: late ? Colors.orange.shade800 : Colors.grey),
+            title: Text('${r['name']}  (${r['mode'] == 'drop' ? 'Drop' : 'Pickup'})'),
+            subtitle: Text('${late ? 'NOT STARTED yet' : 'SCHEDULED'}${label == null ? '' : ' for $label'}${bus == null ? '' : '  |  $bus'}'),
+          ),
+        ));
+      }
     }
+    for (final t in _trips) {
+      final c = _counts[t['id'].toString()] ?? {};
+      final active = t['state'] == 'active';
+      final route = t['routes'] as Map?;
+      final bus = (route?['buses'] as Map?)?['reg_no'];
+      final driver = (t['profiles'] as Map?)?['full_name'];
+      final total = c.values.fold<int>(0, (a, b) => a + b);
+      final done = (c['picked_up'] ?? 0) + (c['dropped'] ?? 0);
+      final started = parseTime(t['started_at']);
+      children.add(Card(
+        child: ListTile(
+          leading: Icon(t['mode'] == 'drop' ? Icons.home : Icons.school, color: active ? Colors.green.shade700 : Colors.grey),
+          title: Text('${route?['name'] ?? 'Route'}  (${t['mode'] == 'drop' ? 'Drop' : 'Pickup'})'),
+          subtitle: Text('${active ? 'RUNNING' : 'Finished'}  |  ${driver ?? ''}  |  ${bus ?? ''}\n'
+              'Started ${started == null ? '' : clockOf(started)}  |  $done of $total done'
+              '${(c['absent'] ?? 0) > 0 ? '  |  ${c['absent']} absent' : ''}'),
+          isThreeLine: true,
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => TripDetailScreen(trip: t))),
+        ),
+      ));
+    }
+    if (children.isEmpty) children.add(const Padding(padding: EdgeInsets.all(32), child: Center(child: Text('Nothing scheduled today.'))));
     return RefreshIndicator(
       onRefresh: _load,
-      child: ListView.builder(
-        padding: const EdgeInsets.all(12),
-        itemCount: _trips.length,
-        itemBuilder: (context, i) {
-          final t = _trips[i];
-          final c = _counts[t['id'].toString()] ?? {};
-          final active = t['state'] == 'active';
-          final route = t['routes'] as Map?;
-          final bus = (route?['buses'] as Map?)?['reg_no'];
-          final driver = (t['profiles'] as Map?)?['full_name'];
-          final total = c.values.fold<int>(0, (a, b) => a + b);
-          final done = (c['picked_up'] ?? 0) + (c['dropped'] ?? 0);
-          final started = parseTime(t['started_at']);
-          return Card(
-            child: ListTile(
-              leading: Icon(t['mode'] == 'drop' ? Icons.home : Icons.school,
-                  color: active ? Colors.green.shade700 : Colors.grey),
-              title: Text('${route?['name'] ?? 'Route'}  (${t['mode'] == 'drop' ? 'Drop' : 'Pickup'})'),
-              subtitle: Text('${active ? 'RUNNING' : 'Finished'}  |  ${driver ?? ''}  |  ${bus ?? ''}\n'
-                  'Started ${started == null ? '' : clockOf(started)}  |  $done of $total done'
-                  '${(c['absent'] ?? 0) > 0 ? '  |  ${c['absent']} absent' : ''}'),
-              isThreeLine: true,
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => TripDetailScreen(trip: t))),
-            ),
-          );
-        },
-      ),
+      child: ListView(padding: const EdgeInsets.all(12), children: children),
     );
   }
 }

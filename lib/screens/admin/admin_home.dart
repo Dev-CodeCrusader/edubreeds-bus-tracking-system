@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart' show UserAttributes;
 import '../../api.dart';
 import '../../util.dart';
 import 'fleet_tab.dart';
+import 'holidays_panel.dart';
 import 'live_trips.dart';
 import 'people_panel.dart';
 import 'students_tab.dart';
@@ -72,6 +73,7 @@ class _AdminHomeState extends State<AdminHome> {
           ),
         ),
       ),
+      Section(title: 'School holidays', child: HolidaysPanel(schoolId: widget.me.schoolId!)),
       Section(
         title: 'My account',
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [

@@ -20,5 +20,8 @@ String phoneToLogin(String phone) {
 const routingBaseUrl = 'https://router.project-osrm.org';
 const routingFallbackUrl = 'https://router.project-osrm.org';
 
+const approachMeters = 400; // "van is arriving" is sent to parents when the van is this close to their stop
+const schoolRadiusM = 150; // the van counts as "at school" inside this distance
+const leftSchoolM = 250; // ...and as "left school" beyond this distance (drop trips)
 const countdownSeconds = 120; // wait after the scheduled pickup time before "Not Available/Ready"
 const alertBuzzSeconds = 60;

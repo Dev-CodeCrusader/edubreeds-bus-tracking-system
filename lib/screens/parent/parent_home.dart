@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../api.dart';
 import '../../util.dart';
+import 'progress_bar.dart';
 import 'track_screen.dart';
 
 /// Parent app: my children with today's trip status, live tracking, "absent today",
@@ -26,6 +27,8 @@ class _ParentHomeState extends State<ParentHome> {
   List<Map<String, dynamic>> _tripStops = [];
   List<Map<String, dynamic>> _absences = [];
   List<Map<String, dynamic>> _notes = [];
+  List<Map<String, dynamic>> _plans = []; // stop_students -> stop -> route, per child
+  String? _holiday;
   RealtimeChannel? _channel;
   Timer? _refresh;
   bool _buzzOpen = false;
@@ -59,6 +62,12 @@ class _ParentHomeState extends State<ParentHome> {
           table: 'trip_stops',
           callback: (_) => _load(quiet: true),
         )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'trips',
+          callback: (_) => _load(quiet: true),
+        )
         .subscribe();
     // safety net if Realtime drops
     _refresh = Timer.periodic(const Duration(seconds: 30), (_) => _load(quiet: true));
@@ -80,13 +89,19 @@ class _ParentHomeState extends State<ParentHome> {
       final since = DateTime(now.year, now.month, now.day).toUtc().toIso8601String();
       final ts = await db
           .from('trip_stops')
-          .select('id, state, done_at, van_arrived_at, student_id, trips!inner(id, mode, state, started_at), stops(name, lat, lng)')
+          .select('id, state, done_at, van_arrived_at, student_id, arriving_at, trips!inner(id, route_id, mode, state, started_at, school_reached_at, left_school_at), stops(name, lat, lng)')
           .gte('trips.started_at', since);
+      final pl = await db
+          .from('stop_students')
+          .select('student_id, stops(name, scheduled_time, lat, lng, routes(id, name, mode, start_time, days))');
+      final hol = await db.from('holidays').select('reason').eq('on_date', istDate()).maybeSingle();
       final ab = await db.from('absence_notices').select('id, student_id, mode').eq('on_date', istDate());
       final nt = await db.from('notifications').select().eq('recipient_id', _uid).order('sent_at', ascending: false).limit(60);
       if (!mounted) return;
       setState(() {
         _kids = kids;
+        _plans = pl.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
+        _holiday = hol == null ? null : (hol['reason'] ?? 'Holiday').toString();
         _tripStops = ts.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
         _absences = ab.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
         _notes = nt.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
@@ -274,8 +289,7 @@ class _ParentHomeState extends State<ParentHome> {
             ),
           ]),
           const SizedBox(height: 10),
-          if (rows.isEmpty) const Text('No trip today yet.', style: TextStyle(color: Colors.grey)),
-          for (final t in rows) _tripRow(kid, t),
+          ..._progressSections(kid, rows, abs),
           if (abs.isNotEmpty) const SizedBox(height: 6),
           Wrap(spacing: 8, children: [
             for (final a in abs)
@@ -294,6 +308,148 @@ class _ParentHomeState extends State<ParentHome> {
         ]),
       ),
     );
+  }
+
+  static const _pickupSteps = [
+    'Scheduled',
+    'Van started',
+    'Van is arriving at your stop. Get ready and wait for the van',
+    'Student boarded the van',
+    'Van reached school',
+  ];
+  static const _dropSteps = [
+    'Scheduled',
+    'Students boarded the van',
+    'Van left the school',
+    'Van is arriving at your stop',
+    'Student dropped',
+  ];
+
+  String _hhmm(dynamic t) {
+    final s = t?.toString();
+    if (s == null || s.length < 5) return '';
+    return s.substring(0, 5);
+  }
+
+  List<Widget> _progressSections(Map<String, dynamic> kid, List<Map<String, dynamic>> rows, List<Map<String, dynamic>> abs) {
+    final sid = kid['id'];
+    final wd = DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30)).weekday;
+    final out = <Widget>[];
+    final plans = _plans.where((p) => p['student_id'] == sid && p['stops'] is Map && (p['stops'] as Map)['routes'] is Map).toList();
+    final seen = <String>{};
+    for (final p in plans) {
+      final stop = Map<String, dynamic>.from(p['stops'] as Map);
+      final route = Map<String, dynamic>.from(stop['routes'] as Map);
+      if (!seen.add(route['id'].toString())) continue;
+      final mode = route['mode'] == 'drop' ? 'drop' : 'pickup';
+      final days = route['days'] is List ? (route['days'] as List).map((e) => (e as num).toInt()).toList() : <int>[1, 2, 3, 4, 5, 6];
+      final runsToday = days.contains(wd);
+      final absent = abs.any((a) => a['mode'] == null || a['mode'] == mode);
+      // today's trip_stop of this child on this route (latest)
+      final mine = rows.where((r) => (r['trips'] as Map)['route_id'].toString() == route['id'].toString()).toList();
+      final t = mine.isEmpty ? null : mine.last;
+      final trip = t == null ? null : Map<String, dynamic>.from(t['trips'] as Map);
+      final state = t?['state']?.toString() ?? 'pending';
+      final labels = mode == 'drop' ? _dropSteps : _pickupSteps;
+      final details = List<String?>.filled(labels.length, null);
+      var step = 0;
+      String? note;
+      var holiday = false;
+      final sched = _hhmm(stop['scheduled_time'] ?? route['start_time']);
+      if (trip == null) {
+        if (_holiday != null) {
+          holiday = true;
+          note = "It's a holiday: $_holiday";
+        } else if (!runsToday) {
+          note = 'No trip today.';
+        } else if (absent) {
+          note = 'Marked absent today.';
+        }
+        details[0] = holiday || !runsToday ? null : (sched.isEmpty ? null : 'Stop time $sched');
+      } else {
+        final active = trip['state'] == 'active';
+        final arriving = t!['arriving_at'] != null || t['van_arrived_at'] != null;
+        if (mode == 'drop') {
+          if (state == 'dropped') {
+            step = 4;
+          } else if (state == 'pending') {
+            step = arriving ? 3 : (trip['left_school_at'] != null ? 2 : 1);
+          } else {
+            step = 4;
+          }
+        } else {
+          if (state == 'picked_up' || state == 'dropped') {
+            step = trip['school_reached_at'] != null ? 4 : 3;
+          } else if (state == 'pending') {
+            step = arriving ? 2 : 1;
+          }
+        }
+        if (state == 'absent') note = 'Marked absent for this trip.';
+        if (state == 'not_available') note = 'The child was not at the stop when the van came.';
+        if (state == 'no_one_at_stop') note = 'Nobody was at the stop when the van came.';
+        if (!active && state == 'pending') note = 'The trip ended before reaching your stop.';
+        final done = parseTime(t['done_at']);
+        if (done != null && (state == 'picked_up' || state == 'dropped')) {
+          details[mode == 'drop' ? 4 : 3] = 'At ${clockOf(done)}';
+        }
+        final started = parseTime(trip['started_at']);
+        if (started != null) details[1] = mode == 'drop' ? null : 'At ${clockOf(started)}';
+        final sr = parseTime(trip['school_reached_at']);
+        if (sr != null && mode == 'pickup') details[4] = 'At ${clockOf(sr)}';
+        final ls = parseTime(trip['left_school_at']);
+        if (ls != null && mode == 'drop') details[2] = 'At ${clockOf(ls)}';
+        if (note == null && step < 4 && active) {
+          out.add(const SizedBox(height: 0));
+        }
+      }
+      out.add(Padding(
+        padding: const EdgeInsets.only(top: 6, bottom: 4),
+        child: Row(children: [
+          Icon(mode == 'drop' ? Icons.home : Icons.school, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('${mode == 'drop' ? 'Drop' : 'Pickup'}  |  ${route['name']}  |  ${stop['name'] ?? ''}',
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+          ),
+          if (trip != null && trip['state'] == 'active' && (state == 'pending' || state == 'picked_up'))
+            FilledButton.tonal(
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => TrackScreen(
+                  tripId: trip['id'].toString(),
+                  tripStopId: t!['id'].toString(),
+                  childName: kid['full_name'].toString(),
+                  stopName: (stop['name'] ?? 'your stop').toString(),
+                  stopLat: (stop['lat'] as num?)?.toDouble(),
+                  stopLng: (stop['lng'] as num?)?.toDouble(),
+                ),
+              )),
+              child: const Text('Track bus'),
+            ),
+        ]),
+      ));
+      if (note != null) {
+        out.add(Container(
+          width: double.infinity,
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: holiday ? Colors.red.shade50 : Colors.orange.shade50,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(note, style: TextStyle(color: holiday ? Colors.red.shade800 : Colors.orange.shade900)),
+        ));
+      }
+      if (!(holiday || (trip == null && (!runsToday || absent)))) {
+        out.add(TripProgress(labels: labels, details: details, step: step));
+      }
+    }
+    if (plans.isEmpty) {
+      if (rows.isEmpty) out.add(const Text('No route is set for this child yet.', style: TextStyle(color: Colors.grey)));
+      for (final t in rows) {
+        out.add(_tripRow(kid, t));
+      }
+    }
+    return out;
   }
 
   Widget _tripRow(Map<String, dynamic> kid, Map<String, dynamic> t) {
@@ -349,6 +505,12 @@ class _ParentHomeState extends State<ParentHome> {
         return Icons.login;
       case 'dropped':
         return Icons.home;
+      case 'arriving':
+        return Icons.near_me;
+      case 'left_school':
+        return Icons.logout;
+      case 'school_reached':
+        return Icons.school;
       default:
         return Icons.info;
     }

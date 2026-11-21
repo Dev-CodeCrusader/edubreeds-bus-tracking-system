@@ -31,6 +31,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _resumeChecked = false;
   Map<String, dynamic>? _active; // the trip already running on the server for this driver
   String? _activeError;
+  String? _holiday; // reason text when today is a school holiday
+  Map<String, String> _todayTrips = {}; // route id -> trip state, for trips this driver started today
   String? _error;
 
   @override
@@ -48,7 +50,13 @@ class _HomeScreenState extends State<HomeScreen> {
         _routes = routes;
         _loading = false;
       });
-      _pickDefaultRoute();
+      try {
+        _holiday = await Api.holidayToday();
+      } catch (_) {}
+      try {
+        _todayTrips = await Api.tripsToday();
+      } catch (_) {}
+      await _autoSelectNext();
       await _loadActive(autoOpen: true);
     } catch (e) {
       setState(() {
@@ -63,11 +71,15 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _loadActive({bool autoOpen = false}) async {
     try {
       final t = await Api.activeTrip();
+      try {
+        _todayTrips = await Api.tripsToday();
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
         _active = t;
         _activeError = null;
       });
+      if (t == null && !autoOpen) await _autoSelectNext(); // a trip just ended: line up the next one
       if (t != null && autoOpen && !_resumeChecked) {
         _resumeChecked = true;
         await _openActive();
@@ -131,6 +143,109 @@ class _HomeScreenState extends State<HomeScreen> {
     await Supabase.instance.client.auth.signOut();
   }
 
+  /// Weekday in India, 1 = Monday ... 7 = Sunday.
+  int get _weekdayIst => DateTime.now().toUtc().add(const Duration(hours: 5, minutes: 30)).weekday;
+
+  /// Today's trips for this driver in time order (only routes that run on today's weekday).
+  List<RouteInfo> get _todayRoutes {
+    final list = _routes.where((r) => r.days.contains(_weekdayIst)).toList();
+    list.sort((a, b) => (a.startTime ?? '99:99').compareTo(b.startTime ?? '99:99'));
+    return list;
+  }
+
+  /// Opens with the next trip that has not been done today already selected.
+  Future<void> _autoSelectNext() async {
+    final next = _todayRoutes.where((r) => _todayTrips[r.id] != 'completed').toList();
+    final pick = next.isEmpty ? null : next.first;
+    if (pick == null) {
+      await _pickDefaultRoute();
+      return;
+    }
+    if (mounted) {
+      setState(() {
+        _mode = pick.mode;
+        _route = pick;
+        _students = [];
+        _inVan.clear();
+      });
+    }
+    if (pick.mode == 'drop') {
+      final s = await Api.routeStudents(pick.id);
+      if (mounted) setState(() => _students = s);
+    }
+  }
+
+  List<Widget> _scheduleWidgets() {
+    final w = <Widget>[];
+    if (_holiday != null) {
+      w.add(Card(
+        color: Colors.red.shade50,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(children: [
+            const Icon(Icons.beach_access, color: Colors.red),
+            const SizedBox(width: 10),
+            Expanded(child: Text('Today is a holiday: $_holiday.\nNo trips are scheduled today.', style: const TextStyle(fontWeight: FontWeight.w600))),
+          ]),
+        ),
+      ));
+      return w;
+    }
+    final today = _todayRoutes;
+    if (today.isEmpty) {
+      w.add(const Padding(padding: EdgeInsets.only(bottom: 8), child: Text('No trips are scheduled for you today.')));
+      return w;
+    }
+    w.add(Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text("Today's trips", style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          for (final r in today)
+            InkWell(
+              onTap: _active != null
+                  ? null
+                  : () async {
+                      setState(() {
+                        _mode = r.mode;
+                        _route = r;
+                        _students = [];
+                        _inVan.clear();
+                      });
+                      if (r.mode == 'drop') {
+                        final s = await Api.routeStudents(r.id);
+                        if (mounted) setState(() => _students = s);
+                      }
+                    },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(children: [
+                  Icon(r.mode == 'drop' ? Icons.home : Icons.school, size: 20),
+                  const SizedBox(width: 8),
+                  SizedBox(width: 48, child: Text(r.startLabel.isEmpty ? '--:--' : r.startLabel, style: const TextStyle(fontWeight: FontWeight.w700))),
+                  Expanded(child: Text('${r.name} (${r.mode == 'drop' ? 'Drop' : 'Pickup'})')),
+                  _statusChip(r),
+                ]),
+              ),
+            ),
+        ]),
+      ),
+    ));
+    return w;
+  }
+
+  Widget _statusChip(RouteInfo r) {
+    final st = _todayTrips[r.id];
+    final selected = _route?.id == r.id && _active == null;
+    if (st == 'completed') return const Chip(label: Text('Done'), avatar: Icon(Icons.check, size: 16), visualDensity: VisualDensity.compact);
+    if (st == 'active') return Chip(label: const Text('Running'), backgroundColor: Colors.green.shade100, visualDensity: VisualDensity.compact);
+    return Chip(
+        label: Text(selected ? 'Next' : 'Scheduled'),
+        backgroundColor: selected ? Theme.of(context).colorScheme.primaryContainer : null,
+        visualDensity: VisualDensity.compact);
+  }
+
   List<RouteInfo> get _modeRoutes => _routes.where((r) => r.mode == _mode).toList();
 
   Future<void> _pickDefaultRoute() async {
@@ -163,7 +278,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   bool get _ready =>
-      _active == null && _activeError == null && _route != null && _selfie != null && (_mode == 'pickup' || _inVan.isNotEmpty) && !_starting;
+      _active == null && _activeError == null && _holiday == null && _route != null && _selfie != null && (_mode == 'pickup' || _inVan.isNotEmpty) && !_starting;
 
   Future<void> _start() async {
     setState(() {
@@ -219,6 +334,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   if (_me != null) Text('Hello, ${_me!.fullName}', style: Theme.of(context).textTheme.titleLarge),
                   const SizedBox(height: 16),
+                  ..._scheduleWidgets(),
                   if (_activeError != null)
                     Card(
                       color: Theme.of(context).colorScheme.errorContainer,

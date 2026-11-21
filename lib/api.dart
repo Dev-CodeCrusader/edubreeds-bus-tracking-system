@@ -1,6 +1,8 @@
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'util.dart' show istDate;
+
 final db = Supabase.instance.client;
 
 /// A point read from a PostGIS `geography` column (PostgREST returns GeoJSON).
@@ -33,7 +35,18 @@ class RouteInfo {
   final String id;
   final String name;
   final String mode; // pickup | drop
-  RouteInfo(this.id, this.name, this.mode);
+  final String? startTime; // "HH:MM:SS" scheduled start of the trip (India time)
+  final List<int> days; // weekdays it runs, 1 = Monday ... 7 = Sunday
+  RouteInfo(this.id, this.name, this.mode, {this.startTime, this.days = const [1, 2, 3, 4, 5, 6]});
+
+  String get startLabel => startTime == null ? '' : startTime!.split(':').take(2).join(':');
+}
+
+/// The school at the end (pickup) or start (drop) of a route.
+class SchoolPoint {
+  final String name;
+  final GeoPoint? at;
+  SchoolPoint(this.name, this.at);
 }
 
 class StudentInfo {
@@ -117,10 +130,43 @@ class Api {
     final uid = db.auth.currentUser!.id;
     final rows = await db
         .from('routes')
-        .select('id, name, mode, buses!inner(driver_id)')
+        .select('id, name, mode, start_time, days, buses!inner(driver_id)')
         .eq('buses.driver_id', uid)
         .order('name');
-    return rows.map<RouteInfo>((r) => RouteInfo(r['id'], r['name'], r['mode'])).toList();
+    return rows
+        .map<RouteInfo>((r) => RouteInfo(r['id'], r['name'], r['mode'],
+            startTime: r['start_time'] as String?,
+            days: r['days'] is List ? (r['days'] as List).map((e) => (e as num).toInt()).toList() : const [1, 2, 3, 4, 5, 6]))
+        .toList();
+  }
+
+  /// Reason text if today is a school holiday, else null.
+  static Future<String?> holidayToday() async {
+    final r = await db.from('holidays').select('reason').eq('on_date', istDate()).maybeSingle();
+    if (r == null) return null;
+    final reason = (r['reason'] ?? '').toString().trim();
+    return reason.isEmpty ? 'Holiday' : reason;
+  }
+
+  /// route id -> trip state for the trips this driver started today (India date).
+  static Future<Map<String, String>> tripsToday() async {
+    final uid = db.auth.currentUser!.id;
+    final now = DateTime.now();
+    final since = DateTime(now.year, now.month, now.day).toUtc().toIso8601String();
+    final rows = await db.from('trips').select('route_id, state, started_at').eq('driver_id', uid).gte('started_at', since).order('started_at');
+    final out = <String, String>{};
+    for (final r in rows) {
+      out[r['route_id'].toString()] = r['state'].toString(); // latest wins
+    }
+    return out;
+  }
+
+  static Future<SchoolPoint> tripSchool(String tripId) async {
+    final r = await db.from('trips').select('routes(name, school_lat, school_lng)').eq('id', tripId).maybeSingle();
+    final route = r?['routes'] as Map?;
+    final lat = (route?['school_lat'] as num?)?.toDouble();
+    final lng = (route?['school_lng'] as num?)?.toDouble();
+    return SchoolPoint('School', lat == null || lng == null ? null : GeoPoint(lat, lng));
   }
 
   /// Students assigned to a route (used to pick who is in the van for DROP).
@@ -227,6 +273,13 @@ class Api {
       });
 
   static Future<void> alert(String tripStopId) => db.rpc('driver_alert', params: {'p_trip_stop': tripStopId});
+
+  static Future<void> markApproaching(String tripId, String stopId) =>
+      db.rpc('mark_approaching', params: {'p_trip': tripId, 'p_stop': stopId});
+
+  static Future<void> markLeftSchool(String tripId) => db.rpc('mark_left_school', params: {'p_trip': tripId});
+
+  static Future<void> markSchoolReached(String tripId) => db.rpc('mark_school_reached', params: {'p_trip': tripId});
 
   static Future<void> finishTrip(String tripId) => db.rpc('finish_trip', params: {'p_trip': tripId});
 }
