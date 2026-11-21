@@ -612,14 +612,10 @@ class _RideScreenState extends State<RideScreen> {
     } else {
       text = 'Finding your location...';
     }
-    final withPos = _stops.where((s) => s.stop.location != null).length;
-    final gps = _pos == null ? 'none yet' : 'ok (+/- ${_pos!.accuracy.round()} m)';
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Text(text, style: TextStyle(fontWeight: FontWeight.w600, color: color)),
-      // Temporary test line: remove once the driver flow is confirmed working.
-      Text('test info: GPS $gps, stops with map position $withPos/${_stops.length}'
-          '${_mapError == null ? '' : ', map error: $_mapError'}',
-          style: const TextStyle(fontSize: 11, color: Colors.grey)),
+      if (_mapError != null)
+        Text('Map problem: $_mapError', style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.error)),
     ]);
   }
 
