@@ -1,7 +1,7 @@
 // Fill these from Supabase: Project Settings -> API.
 // Use the anon (public) key only. Never put the service_role key in the app.
-const supabaseUrl = 'https://YOUR-PROJECT.supabase.co';
-const supabaseAnonKey = 'YOUR-ANON-KEY';
+const supabaseUrl = 'https://xynozwjrneoxtkrfmjxv.supabase.co';
+const supabaseAnonKey = 'sb_publishable_bWH7KziXZipGg6cIF0Mo7A_LVtG9mij';
 
 // Free community map style (OpenFreeMap). Replace with self-hosted tiles before go-live.
 const mapStyleUrl = 'https://tiles.openfreemap.org/styles/liberty';
