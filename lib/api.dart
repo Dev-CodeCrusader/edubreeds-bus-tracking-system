@@ -77,9 +77,10 @@ class Api {
     final uid = db.auth.currentUser!.id;
     final row = await db
         .from('profiles')
-        .select('id, role, full_name, school_id')
+        .select('id, role, full_name, school_id, active')
         .eq('id', uid)
         .single();
+    if (row['active'] == false) throw 'This account has been deactivated. Please contact your school.';
     // The school lookup is separate so a problem there never blocks sign-in.
     Map? school;
     if (row['school_id'] != null) {

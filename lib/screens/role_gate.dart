@@ -2,18 +2,31 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../api.dart';
+import 'admin/admin_home.dart';
+import 'caretaker/caretaker_home.dart';
 import 'home_screen.dart';
+import 'parent/parent_home.dart';
+import 'super/super_home.dart';
 
 /// One app for everyone: after sign-in the user's role (from `profiles.role`)
 /// decides which screens they see. Only the driver screens exist so far; the other
-/// roles get a holding screen until their modules are built.
-class RoleGate extends StatelessWidget {
+/// roles are handled by their own home screens.
+class RoleGate extends StatefulWidget {
   const RoleGate({super.key});
+
+  @override
+  State<RoleGate> createState() => _RoleGateState();
+}
+
+class _RoleGateState extends State<RoleGate> {
+  // Loaded once. (A sign-in token refresh rebuilds this widget; it must not reload the profile
+  // and throw the user back to the start of their screen.)
+  late final Future<DriverProfile> _profile = Api.myProfile();
 
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<DriverProfile>(
-      future: Api.myProfile(),
+      future: _profile,
       builder: (context, snap) {
         if (snap.connectionState != ConnectionState.done) {
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -31,13 +44,13 @@ class RoleGate extends StatelessWidget {
           case 'driver':
             return const HomeScreen();
           case 'parent':
-            return _Message(title: 'Parent', body: 'Live tracking and alerts are coming in the next build.');
+            return ParentHome(me: snap.data!);
           case 'caretaker':
-            return _Message(title: 'Caretaker', body: 'The school gate screen is coming in the next build.');
+            return CaretakerHome(me: snap.data!);
           case 'school_admin':
-            return _Message(title: 'School Admin', body: 'Admin screens are coming in a later build.');
+            return AdminHome(me: snap.data!);
           case 'super_admin':
-            return _Message(title: 'Super Admin', body: 'Platform screens are coming in a later build.');
+            return SuperHome(me: snap.data!);
           default:
             return _Message(title: 'Unknown role', body: 'Please contact support.');
         }

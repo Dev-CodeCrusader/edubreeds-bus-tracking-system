@@ -65,6 +65,8 @@ class LocationService {
       db.from('live_positions').upsert({
         'trip_id': tripId,
         'location': point,
+        'lat': p.latitude,
+        'lng': p.longitude,
         'speed_kmh': p.speed * 3.6,
         'heading': p.heading,
         'updated_at': now.toUtc().toIso8601String(),

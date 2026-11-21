@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 
+import 'config.dart';
+
 class RoutePoint {
   final double lat;
   final double lng;
@@ -70,15 +72,23 @@ class RoutePlan {
 /// Road routing from the free public OSRM demo server (fine for a small pilot; it has no
 /// uptime promise, so move to your own OSRM/Valhalla before many schools depend on it).
 class Routing {
-  static const _base = 'https://router.project-osrm.org/route/v1/driving';
+  static String _url(String base, String coords) =>
+      '$base/route/v1/driving/$coords?overview=false&geometries=geojson&steps=true';
 
   /// ONE request for the whole journey: bus -> stop 1 -> stop 2 -> ...
   static Future<List<RouteLeg>> plan(RoutePoint from, List<RoutePoint> stops) async {
     final all = [from, ...stops];
     final coords = all.map((p) => '${p.lng},${p.lat}').join(';');
-    final url = Uri.parse('$_base/$coords?overview=false&geometries=geojson&steps=true');
-    final res = await http.get(url).timeout(const Duration(seconds: 15));
-    if (res.statusCode != 200) throw 'Routing server answered ${res.statusCode}';
+    // Own server first; the fallback is used only if the first one fails.
+    http.Response res;
+    try {
+      res = await http.get(Uri.parse(_url(routingBaseUrl, coords))).timeout(const Duration(seconds: 8));
+      if (res.statusCode != 200) throw 'status ${res.statusCode}';
+    } catch (_) {
+      if (routingFallbackUrl.isEmpty || routingFallbackUrl == routingBaseUrl) rethrow;
+      res = await http.get(Uri.parse(_url(routingFallbackUrl, coords))).timeout(const Duration(seconds: 15));
+      if (res.statusCode != 200) throw 'Routing server answered ${res.statusCode}';
+    }
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     final routes = body['routes'] as List?;
     if (body['code'] != 'Ok' || routes == null || routes.isEmpty) throw 'No road route found';

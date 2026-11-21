@@ -1,7 +1,7 @@
 // Fill these from Supabase: Project Settings -> API.
 // Use the anon (public) key only. Never put the service_role key in the app.
-const supabaseUrl = 'https://ephlpdddpxuzraxwqxvp.supabase.co';
-const supabaseAnonKey = 'sb_publishable_6dSN_X-PWODOexu2r0fQEg_H040JxNM';
+const supabaseUrl = 'https://YOUR-PROJECT.supabase.co';
+const supabaseAnonKey = 'YOUR-ANON-KEY';
 
 // Free community map style (OpenFreeMap). Replace with self-hosted tiles before go-live.
 const mapStyleUrl = 'https://tiles.openfreemap.org/styles/liberty';
@@ -14,6 +14,11 @@ String phoneToLogin(String phone) {
   final national = digits.length > 10 ? digits.substring(digits.length - 10) : digits;
   return '$national@users.edubreeds.app';
 }
+
+// Road routing server. Start with your own OSRM server once it is running (see routing-server/README.md),
+// e.g. 'https://route.edubreeds.org'. The public demo server is the fallback if yours is unreachable.
+const routingBaseUrl = 'https://router.project-osrm.org';
+const routingFallbackUrl = 'https://router.project-osrm.org';
 
 const countdownSeconds = 120; // wait after the scheduled pickup time before "Not Available/Ready"
 const alertBuzzSeconds = 60;
