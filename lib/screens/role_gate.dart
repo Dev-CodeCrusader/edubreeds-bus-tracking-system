@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../api.dart';
+import '../branding.dart';
+import '../push_service.dart';
 import 'admin/admin_home.dart';
 import 'caretaker/caretaker_home.dart';
 import 'home_screen.dart';
@@ -21,7 +23,11 @@ class RoleGate extends StatefulWidget {
 class _RoleGateState extends State<RoleGate> {
   // Loaded once. (A sign-in token refresh rebuilds this widget; it must not reload the profile
   // and throw the user back to the start of their screen.)
-  late final Future<DriverProfile> _profile = Api.myProfile();
+  late final Future<DriverProfile> _profile = Api.myProfile().then((p) {
+    brandColor.value = parseHexColor(p.brandHex) ?? defaultBrandColor; // white-label colour
+    Push.register(); // phone alerts (Android); safe no-op elsewhere
+    return p;
+  });
 
   @override
   Widget build(BuildContext context) {

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../api.dart';
+import '../../branding.dart';
 import '../../util.dart';
 import '../admin/admin_home.dart' show changeMyPassword;
 import '../admin/people_panel.dart';
@@ -31,7 +32,7 @@ class _SuperHomeState extends State<SuperHome> {
     setState(() => _loading = true);
     try {
       final s = await db.from('schools').select('id, name, city, group_id, photos_enabled, plan, app_groups(name)').order('name');
-      final g = await db.from('app_groups').select('id, name').order('name');
+      final g = await db.from('app_groups').select('id, name, theme').order('name');
       if (!mounted) return;
       setState(() {
         _schools = s.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
@@ -48,22 +49,33 @@ class _SuperHomeState extends State<SuperHome> {
     }
   }
 
-  Future<void> _addGroup() async {
-    final c = TextEditingController();
-    final name = await showDialog<String>(
+  /// Create or edit a shared app: its name and its colour (white-label look for every school in it).
+  Future<void> _editGroup([Map<String, dynamic>? g]) async {
+    final theme = g?['theme'] is Map ? Map<String, dynamic>.from(g!['theme'] as Map) : <String, dynamic>{};
+    final name = TextEditingController(text: g?['name']?.toString() ?? '');
+    final color = TextEditingController(text: theme['color']?.toString() ?? '#1B5E9E');
+    final ok = await showDialog<bool>(
       context: context,
       builder: (d) => AlertDialog(
-        title: const Text('New shared app (group of schools)'),
-        content: TextField(controller: c, decoration: const InputDecoration(labelText: 'Group name')),
+        title: Text(g == null ? 'New shared app (group of schools)' : 'Edit shared app'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: name, decoration: const InputDecoration(labelText: 'App / group name')),
+          TextField(controller: color, decoration: const InputDecoration(labelText: 'Brand colour (hex, e.g. #1B5E9E)')),
+        ]),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(d, c.text.trim()), child: const Text('Create')),
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Save')),
         ],
       ),
     );
-    if (name == null || name.isEmpty) return;
+    if (ok != true || name.text.trim().isEmpty) return;
     try {
-      await db.from('app_groups').insert({'name': name});
+      final data = {'name': name.text.trim(), 'theme': {...theme, 'name': name.text.trim(), 'color': color.text.trim()}};
+      if (g == null) {
+        await db.from('app_groups').insert(data);
+      } else {
+        await db.from('app_groups').update(data).eq('id', g['id']);
+      }
       _load();
     } catch (e) {
       if (mounted) toast(context, errText(e));
@@ -96,7 +108,7 @@ class _SuperHomeState extends State<SuperHome> {
       Padding(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
         child: Row(children: [
-          OutlinedButton.icon(onPressed: _addGroup, icon: const Icon(Icons.apps), label: const Text('New app group')),
+          OutlinedButton.icon(onPressed: () => _editGroup(), icon: const Icon(Icons.apps), label: const Text('New app group')),
           const Spacer(),
           FilledButton.icon(onPressed: () => _openSchool(), icon: const Icon(Icons.add), label: const Text('Add school')),
         ]),
@@ -130,6 +142,20 @@ class _SuperHomeState extends State<SuperHome> {
 
   Widget _settingsTab() {
     return ListView(children: [
+      Section(
+        title: 'Shared apps (groups of schools)',
+        child: Column(children: [
+          for (final g in _groups)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.apps, color: parseHexColor(((g['theme'] as Map?)?['color'])?.toString())),
+              title: Text(g['name'].toString()),
+              trailing: const Icon(Icons.edit),
+              onTap: () => _editGroup(g),
+            ),
+          if (_groups.isEmpty) const Text('No shared apps yet.'),
+        ]),
+      ),
       Section(
         title: 'My account',
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [

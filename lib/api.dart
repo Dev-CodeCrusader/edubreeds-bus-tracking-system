@@ -25,7 +25,8 @@ class DriverProfile {
   final String? schoolId;
   final String schoolName;
   final bool photosEnabled;
-  DriverProfile(this.id, this.role, this.fullName, this.schoolId, this.schoolName, this.photosEnabled);
+  final String? brandHex; // the school group's app colour, e.g. #1B5E9E
+  DriverProfile(this.id, this.role, this.fullName, this.schoolId, this.schoolName, this.photosEnabled, {this.brandHex});
 }
 
 class RouteInfo {
@@ -87,9 +88,17 @@ class Api {
       try {
         school = await db
             .from('schools')
-            .select('name, photos_enabled')
+            .select('name, photos_enabled, group_id')
             .eq('id', row['school_id'])
             .maybeSingle();
+      } catch (_) {}
+    }
+    String? hex;
+    if (school?['group_id'] != null) {
+      try {
+        final g = await db.from('app_groups').select('theme').eq('id', school!['group_id']).maybeSingle();
+        final theme = g?['theme'];
+        if (theme is Map && theme['color'] != null) hex = theme['color'].toString();
       } catch (_) {}
     }
     return DriverProfile(
@@ -99,6 +108,7 @@ class Api {
       row['school_id'],
       school?['name'] ?? '',
       (school?['photos_enabled'] ?? true) as bool,
+      brandHex: hex,
     );
   }
 

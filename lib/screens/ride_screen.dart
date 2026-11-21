@@ -4,11 +4,13 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../api.dart';
 import '../config.dart';
 import '../location_service.dart';
 import '../routing.dart';
+import '../voice.dart';
 
 /// The 50/50 ride screen: map on top, control deck below.
 /// Pickup: [Picked Up] [Student Absent] [Alert (time-gated)]
@@ -70,6 +72,8 @@ class _RideScreenState extends State<RideScreen> {
   double? _totalS;
   Timer? _sync;
   bool _ending = false;
+  bool _offline = false;
+  String _spoken = '';
 
   bool get _isPickup => widget.mode == 'pickup';
 
@@ -88,6 +92,9 @@ class _RideScreenState extends State<RideScreen> {
     })
       ..start();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
+    try {
+      WakelockPlus.enable(); // keep the screen on while driving
+    } catch (_) {}
     _sync = Timer.periodic(const Duration(seconds: 10), (_) => _syncTrip());
     _refresh();
   }
@@ -96,6 +103,10 @@ class _RideScreenState extends State<RideScreen> {
   void dispose() {
     _ticker?.cancel();
     _sync?.cancel();
+    try {
+      WakelockPlus.disable();
+    } catch (_) {}
+    Voice.stop();
     _loc.stop();
     super.dispose();
   }
@@ -125,6 +136,7 @@ class _RideScreenState extends State<RideScreen> {
     try {
       final state = await Api.tripState(widget.tripId);
       if (!mounted || _ending) return;
+      if (_offline) setState(() => _offline = false);
       if (state != null && state != 'active') {
         _ending = true;
         _toast('This trip has ended.');
@@ -140,6 +152,7 @@ class _RideScreenState extends State<RideScreen> {
       if (_styleReady) _drawRoute();
     } catch (_) {
       // offline for a moment; the next round retries
+      if (mounted && !_offline) setState(() => _offline = true);
     }
   }
 
@@ -336,9 +349,35 @@ class _RideScreenState extends State<RideScreen> {
     await _run(() async {
       await _loc.stop();
       await Api.finishTrip(widget.tripId);
+      if (mounted) await _showSummary();
       if (mounted) Navigator.of(context).pop();
     });
     if (mounted && _ending) _ending = false; // the end did not go through
+  }
+
+  Future<void> _showSummary() {
+    int n(String st) => _stops.where((s) => s.state == st).length;
+    final rows = <MapEntry<String, int>>[
+      if (_isPickup) MapEntry('Picked up', n('picked_up')) else MapEntry('Dropped', n('dropped')),
+      MapEntry('Absent', n('absent')),
+      MapEntry('Not available at the stop', n('not_available')),
+      MapEntry('Nobody at the stop', n('no_one_at_stop')),
+      MapEntry('Still waiting (not handled)', n('pending')),
+    ];
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => AlertDialog(
+        icon: const Icon(Icons.check_circle, color: Colors.green, size: 40),
+        title: const Text('Trip finished'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          for (final r in rows)
+            if (r.value > 0 || r.key.startsWith('Picked') || r.key.startsWith('Dropped'))
+              Row(children: [Expanded(child: Text(r.key)), Text('${r.value}', style: const TextStyle(fontWeight: FontWeight.w700))]),
+        ]),
+        actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('Done'))],
+      ),
+    );
   }
 
   // ------------------------------------------------------------------ map
@@ -528,12 +567,21 @@ class _RideScreenState extends State<RideScreen> {
       final planOldEnough = DateTime.now().difference(_lastPlanAt).inSeconds >= 15;
       if (longEnough && planOldEnough) {
         _markPlanDirty(); // left the route: plan again from here
+        Voice.speak('Recalculating');
         _offRouteSince = null;
       }
     } else {
       _offRouteSince = null;
     }
 
+    final nextIdx = (_stepIdx + 1 < leg.steps.length) ? _stepIdx + 1 : leg.steps.length - 1;
+    final nextStep = leg.steps[nextIdx];
+    final dNext = Geolocator.distanceBetween(p.latitude, p.longitude, nextStep.at.lat, nextStep.at.lng);
+    final key = '$_legIdx:$nextIdx';
+    if (dNext < 250 && _spoken != key) {
+      _spoken = key;
+      Voice.speak(dNext < 40 ? nextStep.text : 'In ${(dNext / 10).round() * 10} metres, ${nextStep.text}');
+    }
     while (_stepIdx + 1 < leg.steps.length - 1) {
       final next = leg.steps[_stepIdx + 1].at;
       if (Geolocator.distanceBetween(p.latitude, p.longitude, next.lat, next.lng) < 25) {
@@ -869,6 +917,14 @@ class _RideScreenState extends State<RideScreen> {
         ),
         body: Column(
           children: [
+            if (_offline)
+              Container(
+                width: double.infinity,
+                color: Colors.red.shade700,
+                padding: const EdgeInsets.all(6),
+                child: const Text('No internet. Your actions are not saved until it is back.',
+                    textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontSize: 12)),
+              ),
             Expanded(
               flex: 1,
               child: Stack(children: [
@@ -884,6 +940,16 @@ class _RideScreenState extends State<RideScreen> {
                   right: 8,
                   bottom: 8,
                   child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    FloatingActionButton.small(
+                      heroTag: 'voice',
+                      tooltip: 'Voice directions',
+                      onPressed: () {
+                        setState(() => Voice.enabled = !Voice.enabled);
+                        if (!Voice.enabled) Voice.stop();
+                      },
+                      child: Icon(Voice.enabled ? Icons.volume_up : Icons.volume_off),
+                    ),
+                    const SizedBox(height: 8),
                     FloatingActionButton.small(
                       heroTag: 'overview',
                       tooltip: 'Show all stops',

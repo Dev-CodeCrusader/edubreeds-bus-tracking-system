@@ -132,6 +132,7 @@ class _StudentFormState extends State<StudentForm> {
   bool _saving = false;
 
   List<Map<String, dynamic>> _guardians = [];
+  List<Map<String, dynamic>> _consents = [];
   List<Map<String, dynamic>> _routes = [];
   final Map<String, String?> _stopByRoute = {};
 
@@ -160,6 +161,7 @@ class _StudentFormState extends State<StudentForm> {
           .eq('school_id', widget.me.schoolId!)
           .order('name');
       final a = await db.from('stop_students').select('stop_id').eq('student_id', _id!);
+      final cs = await db.from('consents').select('id, signed_at, revoked_at, document_url').eq('student_id', _id!).order('signed_at', ascending: false);
       final mine = a.map((e) => e['stop_id'].toString()).toSet();
       final routes = r.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
       final by = <String, String?>{};
@@ -171,6 +173,7 @@ class _StudentFormState extends State<StudentForm> {
       if (!mounted) return;
       setState(() {
         _guardians = g.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
+        _consents = cs.map<Map<String, dynamic>>((e) => Map<String, dynamic>.from(e)).toList();
         _routes = routes;
         _stopByRoute
           ..clear()
@@ -181,7 +184,57 @@ class _StudentFormState extends State<StudentForm> {
     }
   }
 
+  bool get _hasConsent => _consents.any((c) => c['revoked_at'] == null);
+
+  Future<void> _addConsent() async {
+    final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 80, maxWidth: 1600);
+    if (x == null) return;
+    try {
+      final bytes = await x.readAsBytes();
+      final path = '${widget.me.schoolId}/${_id}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      await db.storage.from('consents').uploadBinary(path, bytes, fileOptions: const FileOptions(contentType: 'image/jpeg'));
+      await db.from('consents').insert({'student_id': _id, 'document_url': path, 'signed_at': istDate()});
+      if (mounted) toast(context, 'Consent form saved. Pictures can now be added.');
+      _loadExtras();
+    } catch (e) {
+      if (mounted) toast(context, errText(e));
+    }
+  }
+
+  Future<void> _revokeConsent(Map<String, dynamic> c) async {
+    if (!await confirm(context, 'Revoke consent?', 'The student\'s picture will be removed from the app.', yes: 'Revoke')) return;
+    try {
+      await db.from('consents').update({'revoked_at': DateTime.now().toUtc().toIso8601String()}).eq('id', c['id']);
+      await db.from('students').update({'photo_url': null}).eq('id', _id!);
+      setState(() => _photoPath = null);
+      _loadExtras();
+    } catch (e) {
+      if (mounted) toast(context, errText(e));
+    }
+  }
+
+  Future<void> _viewConsent(Map<String, dynamic> c) async {
+    final url = await Api.signedUrl('consents', c['document_url'].toString());
+    if (url == null || !mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('Signed consent form'),
+        content: Image.network(url),
+        actions: [TextButton(onPressed: () => Navigator.pop(d), child: const Text('Close'))],
+      ),
+    );
+  }
+
   Future<void> _pickPhoto() async {
+    if (_id == null) {
+      toast(context, 'Save the student first, then upload the signed consent form, then add the picture.');
+      return;
+    }
+    if (!_hasConsent) {
+      toast(context, 'Upload the parent\'s signed consent form first (section below).');
+      return;
+    }
     final x = await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 70, maxWidth: 800);
     if (x == null) return;
     final b = await x.readAsBytes();
@@ -334,6 +387,23 @@ class _StudentFormState extends State<StudentForm> {
                   trailing: IconButton(icon: const Icon(Icons.link_off), tooltip: 'Remove', onPressed: () => _removeGuardian(g['parent_id'].toString())),
                 ),
               OutlinedButton.icon(onPressed: _addGuardian, icon: const Icon(Icons.person_add), label: const Text('Add parent')),
+            ]),
+          ),
+          Section(
+            title: 'Picture consent',
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              if (_consents.isEmpty) const Text('No signed consent on file. Pictures cannot be added.', style: TextStyle(color: Colors.grey)),
+              for (final c in _consents)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(c['revoked_at'] == null ? Icons.verified : Icons.block, color: c['revoked_at'] == null ? Colors.green : Colors.red),
+                  title: Text('Signed ${c['signed_at']}${c['revoked_at'] == null ? '' : '  (revoked)'}'),
+                  onTap: () => _viewConsent(c),
+                  trailing: c['revoked_at'] == null
+                      ? TextButton(onPressed: () => _revokeConsent(c), child: const Text('Revoke'))
+                      : null,
+                ),
+              OutlinedButton.icon(onPressed: _addConsent, icon: const Icon(Icons.upload_file), label: const Text('Upload signed consent form')),
             ]),
           ),
           Section(

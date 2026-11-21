@@ -345,6 +345,10 @@ class _ParentHomeState extends State<ParentHome> {
         return Icons.notifications_active;
       case 'absent_proof':
         return Icons.photo_camera;
+      case 'picked_up':
+        return Icons.login;
+      case 'dropped':
+        return Icons.home;
       default:
         return Icons.info;
     }
