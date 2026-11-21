@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'api.dart';
 
 /// Admin actions that need the server-side `manage-user` function (it holds the service key).
@@ -17,9 +19,17 @@ class AdminApi {
       'role': role,
       'school_id': schoolId,
     });
-    final d = r.data;
+    dynamic d = r.data;
+    if (d is String) {
+      try {
+        d = jsonDecode(d);
+      } catch (_) {}
+    }
     if (d is Map && d['user_id'] != null) return d['user_id'].toString();
-    throw 'Could not create the account';
+    if (d is Map && d['error'] != null) throw d['error'].toString();
+    // Not our function's answer: show what came back so the problem can be found.
+    throw 'The manage-user function did not create the account. It answered: $d. '
+        'Check that the function named manage-user contains the code from manage-user/index.ts.';
   }
 
   static Future<void> setPassword(String userId, String password) async {
