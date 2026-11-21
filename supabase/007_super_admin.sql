@@ -6,8 +6,8 @@
 
 do $$
 declare
-  v_phone text := '9000000001';        -- <- the 10-digit number you used in the email
-  v_name  text := 'EDUBREEDS Admin';   -- <- your name
+  v_phone text := '8926122834';        -- <- the 10-digit number you used in the email
+  v_name  text := 'Lalatendu Nanda';   -- <- your name
   u uuid;
 begin
   select id into u from auth.users where email = v_phone || '@users.edubreeds.app';
